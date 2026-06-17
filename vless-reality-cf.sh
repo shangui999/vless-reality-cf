@@ -149,8 +149,7 @@ db_get_field() {
 }
 
 db_set_field() {
-    local filter="$1"
-    _db_apply "$filter"
+    _db_apply "$@"
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -255,25 +254,60 @@ install_deps() {
 
 install_nginx() {
     if check_cmd nginx; then
-        # 检查是否有 stream 模块
-        if nginx -V 2>&1 | grep -q "with-stream"; then
+        # 检查是否有 stream 模块 (静态编译或动态模块 .so 文件存在)
+        local has_stream=false
+        if nginx -V 2>&1 | grep -q "with-stream\b\|with-stream=dynamic"; then
+            # 如果是动态模块，检查 .so 文件是否存在
+            if nginx -V 2>&1 | grep -q "stream=dynamic"; then
+                for mod_path in /usr/lib/nginx/modules/ngx_stream_module.so \
+                                /usr/share/nginx/modules/ngx_stream_module.so \
+                                /etc/nginx/modules/ngx_stream_module.so; do
+                    [[ -f "$mod_path" ]] && has_stream=true && break
+                done
+                # .so 不存在但 nginx 支持动态 stream → 需要安装包
+                if [[ "$has_stream" == "false" ]]; then
+                    _info "安装 Nginx stream 动态模块..."
+                    case "$DISTRO" in
+                        debian|ubuntu)
+                            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libnginx-mod-stream >/dev/null 2>&1
+                            ;;
+                        centos)
+                            yum install -y -q nginx-mod-stream >/dev/null 2>&1
+                            ;;
+                    esac
+                    # 再检查一次
+                    for mod_path in /usr/lib/nginx/modules/ngx_stream_module.so \
+                                    /usr/share/nginx/modules/ngx_stream_module.so \
+                                    /etc/nginx/modules/ngx_stream_module.so; do
+                        [[ -f "$mod_path" ]] && has_stream=true && break
+                    done
+                fi
+            else
+                # 静态编译的 stream
+                has_stream=true
+            fi
+        fi
+
+        if [[ "$has_stream" == "true" ]]; then
             _ok "Nginx 已安装 (含 stream 模块)"
             return 0
         else
-            _warn "Nginx 已安装但缺少 stream 模块，重新安装..."
+            _warn "Nginx 已安装但无法获取 stream 模块，重新安装..."
         fi
     fi
 
-    _info "安装 Nginx (需要 stream 模块用于 SNI 分流)..."
+    _info "安装 Nginx (含 stream 模块用于 SNI 分流)..."
     case "$DISTRO" in
         alpine)
             apk add --no-cache nginx nginx-stream >/dev/null 2>&1 || \
             apk add --no-cache nginx >/dev/null 2>&1
             ;;
         centos)
+            yum install -y -q nginx nginx-mod-stream >/dev/null 2>&1 || \
             yum install -y -q nginx >/dev/null 2>&1
             ;;
         debian|ubuntu)
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx libnginx-mod-stream >/dev/null 2>&1 || \
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx >/dev/null 2>&1
             ;;
     esac
@@ -333,23 +367,52 @@ EOF
 
     _ok "Nginx SNI 分流配置已生成: $NGINX_SNI_CONF"
 
-    # 确保 nginx.conf 包含 stream.conf.d
+    # 确保 nginx.conf 包含 stream block
     if ! grep -q "stream.conf.d" /etc/nginx/nginx.conf 2>/dev/null; then
-        # 在 nginx.conf 末尾 } 前插入 stream block
-        if grep -q "^}" /etc/nginx/nginx.conf; then
-            # 在最后 } 前插入
-            sed -i '/^}/i \
-# SNI stream 分流 (VLESS Reality)\
-stream {\
-    include /etc/nginx/stream.conf.d/*.conf;\
-}' /etc/nginx/nginx.conf 2>/dev/null || {
-                # sed 失败，手动追加
-                echo "" >> /etc/nginx/nginx.conf
-                echo "stream {" >> /etc/nginx/nginx.conf
-                echo "    include /etc/nginx/stream.conf.d/*.conf;" >> /etc/nginx/nginx.conf
-                echo "}" >> /etc/nginx/nginx.conf
-            }
-            _ok "已在 nginx.conf 中添加 stream block"
+        # 检查是否需要 load_module (动态模块)
+        local need_load_module=false
+        if nginx -V 2>&1 | grep -q "stream=dynamic"; then
+            need_load_module=true
+        fi
+        # 检查动态模块文件是否存在
+        local stream_module=""
+        for mod_path in /usr/lib/nginx/modules/ngx_stream_module.so \
+                        /usr/share/nginx/modules/ngx_stream_module.so \
+                        /etc/nginx/modules/ngx_stream_module.so; do
+            if [[ -f "$mod_path" ]]; then
+                stream_module="$mod_path"
+                break
+            fi
+        done
+
+        # 在 nginx.conf 最前面加 load_module (如果需要，且没被 modules-enabled 加载)
+        if [[ "$need_load_module" == "true" && -n "$stream_module" ]]; then
+            local already_loaded=false
+            # Debian 的 modules-enabled 机制会自动加载
+            if ls /etc/nginx/modules-enabled/*stream* 2>/dev/null | grep -q .; then
+                already_loaded=true
+            fi
+            # nginx.conf 里是否已有 load_module
+            if grep -q "ngx_stream_module" /etc/nginx/nginx.conf 2>/dev/null; then
+                already_loaded=true
+            fi
+            if [[ "$already_loaded" == "false" ]]; then
+                sed -i "1i\\load_module ${stream_module};" /etc/nginx/nginx.conf
+                _ok "已添加 load_module ngx_stream_module"
+            fi
+        fi
+
+        # 在 nginx.conf 末尾追加 stream block (必须和 events/http 同级)
+        # 不能插入到 http{} 或 events{} 内部，必须 append 到文件末尾
+        if ! grep -q "stream.conf.d" /etc/nginx/nginx.conf 2>/dev/null; then
+            cat >> /etc/nginx/nginx.conf <<'STREAMEOF'
+
+# SNI stream 分流 (VLESS Reality)
+stream {
+    include /etc/nginx/stream.conf.d/*.conf;
+}
+STREAMEOF
+            _ok "已在 nginx.conf 末尾添加 stream block"
         fi
     fi
 }
