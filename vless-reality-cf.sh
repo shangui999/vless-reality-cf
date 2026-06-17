@@ -749,82 +749,40 @@ check_sni_validity() {
 }
 
 # 选择 SNI 域名的交互菜单
-# 结果通过全局变量 SELECTED_SNI 返回 (不用 echo，避免子 shell 捕获 stdout 的问题)
-# 返回 0 = 成功选中, 1 = 取消/重试
+# 结果通过全局变量 SELECTED_SNI 返回
 SELECTED_SNI=""
 
 select_sni_domain() {
     SELECTED_SNI=""
-    echo ""
     _line
-    echo -e "  ${W}选择 Reality SNI 域名 (偷哪个域名)${NC}"
+    echo -e "  ${W}偷哪个 CF CDN 域名?${NC}"
     echo ""
-    echo -e "  ${D}选择原则:${NC}"
-    echo -e "  ${D}• 部署在 Cloudflare CDN 上的站点${NC}"
-    echo -e "  ${D}• 在大陆可访问 (避免被墙)${NC}"
-    echo -e "  ${D}• 支持 TLS 1.3${NC}"
-    echo -e "  ${D}• 不要太热门/敏感 (避免被重点关注)${NC}"
-    echo ""
-    _line
-
     local i=1
     for d in "${CF_CDN_DOMAINS[@]}"; do
-        if [[ "$d" == "speed.cloudflare.com" ]]; then
-            _item "$i" "$d  ${Y}← 推荐${NC}"
-        elif [[ "$d" == "www.cloudflare.com" ]]; then
-            _item "$i" "$d  ${D}(CF 官网)${NC}"
-        elif [[ "$d" == "dash.cloudflare.com" ]]; then
-            _item "$i" "$d  ${D}(CF 面板)${NC}"
-        else
-            _item "$i" "$d"
-        fi
+        case "$d" in
+            speed.cloudflare.com)  _item "$i" "$d  ${Y}← 推荐${NC}" ;;
+            www.cloudflare.com)    _item "$i" "$d  ${D}(CF官网)${NC}" ;;
+            dash.cloudflare.com)   _item "$i" "$d  ${D}(CF面板)${NC}" ;;
+            *)                     _item "$i" "$d" ;;
+        esac
         ((i++))
     done
-    _item "c" "自定义域名 (输入后自动校验)"
-    _item "0" "返回"
+    _item "c" "自定义域名"
     _line
 
     local choice
-    read -rp "  请选择 [默认 1: speed.cloudflare.com]: " choice
+    read -rp "  请选择 [默认 1]: " choice
     choice=${choice:-1}
 
     if [[ "$choice" == "c" || "$choice" == "C" ]]; then
-        echo ""
-        local custom_domain
-        read -rp "  输入自定义域名: " custom_domain
+        read -rp "  输入域名: " custom_domain
         custom_domain=$(echo "$custom_domain" | xargs)
-
-        if [[ -z "$custom_domain" ]]; then
-            _err "域名不能为空"
-            return 1
-        fi
-
-        if [[ ! "$custom_domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*\.)+[a-zA-Z]{2,}$ ]]; then
-            _err "无效的域名格式"
-            return 1
-        fi
-
-        # 自动校验
-        check_sni_validity "$custom_domain" || true
-        echo ""
-        read -rp "  使用此域名? [Y/n]: " confirm
-        if [[ "${confirm,,}" == "n" ]]; then
-            return 1
-        fi
+        [[ -z "$custom_domain" ]] && { _err "不能为空"; return 1; }
+        [[ ! "$custom_domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*\.)+[a-zA-Z]{2,}$ ]] && { _err "格式无效"; return 1; }
         SELECTED_SNI="$custom_domain"
         return 0
-    elif [[ "$choice" == "0" ]]; then
-        return 1
     elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#CF_CDN_DOMAINS[@]} ]]; then
-        local selected="${CF_CDN_DOMAINS[$((choice-1))]}"
-        echo ""
-        _info "已选择: $selected"
-        echo ""
-        read -rp "  执行 SNI 校验? [Y/n]: " do_check
-        if [[ "${do_check,,}" != "n" ]]; then
-            check_sni_validity "$selected"
-        fi
-        SELECTED_SNI="$selected"
+        SELECTED_SNI="${CF_CDN_DOMAINS[$((choice-1))]}"
         return 0
     else
         _err "无效选择"
@@ -1286,7 +1244,6 @@ do_install() {
     echo ""
 
     # 6. 选择 SNI 域名
-    echo -e "  ${W}选择 SNI 伪装域名 (偷 CF CDN 域名)${NC}"
     local sni=""
     while [[ -z "$sni" ]]; do
         if select_sni_domain; then
