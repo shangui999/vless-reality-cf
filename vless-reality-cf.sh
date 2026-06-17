@@ -225,19 +225,19 @@ install_deps() {
     case "$DISTRO" in
         alpine)
             apk update -q 2>/dev/null
-            apk add --no-cache curl jq openssl ca-certificates coreutils >/dev/null 2>&1
+            apk add --no-cache curl jq openssl ca-certificates coreutils unzip >/dev/null 2>&1
             # gcompat 兼容层
             apk add --no-cache gcompat libc6-compat >/dev/null 2>&1
             ;;
         centos)
-            yum install -y -q curl jq openssl ca-certificates coreutils >/dev/null 2>&1
+            yum install -y -q curl jq openssl ca-certificates coreutils unzip >/dev/null 2>&1
             ;;
         debian|ubuntu)
             apt-get update -qq >/dev/null 2>&1
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl jq openssl ca-certificates coreutils >/dev/null 2>&1
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl jq openssl ca-certificates coreutils unzip >/dev/null 2>&1
             ;;
         *)
-            _warn "未知发行版，请手动安装: curl jq openssl"
+            _warn "未知发行版，请手动安装: curl jq openssl unzip"
             ;;
     esac
     _ok "依赖安装完成"
