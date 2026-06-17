@@ -9,7 +9,8 @@
 #        精简为仅 VLESS Reality + CF 域名 + 用户管理
 #═══════════════════════════════════════════════════════════════════════════════
 
-set -euo pipefail
+# 不启用 set -e，交互式脚本中很多命令预期返回非零 (grep/curl/jq 等)
+# set -euo pipefail
 
 readonly VERSION="1.0.0"
 readonly CFG="/etc/vless-reality-cf"
@@ -47,7 +48,7 @@ else
     DISTRO="unknown"
 fi
 
-check_root() { [[ $EUID -ne 0 ]] && { _err "请使用 root 权限运行"; exit 1; }; }
+check_root() { if [[ $EUID -ne 0 ]]; then _err "请使用 root 权限运行"; exit 1; fi; }
 check_cmd()  { command -v "$1" &>/dev/null; }
 
 #═══════════════════════════════════════════════════════════════════════════════
