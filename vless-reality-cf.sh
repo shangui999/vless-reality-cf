@@ -538,14 +538,50 @@ gen_short_id() {
     local sid
     sid=$(head -c 8 /dev/urandom 2>/dev/null | od -A n -t x1 | tr -d ' \n' | head -c 16)
     if [[ -z "$sid" || ${#sid} -lt 16 ]]; then
-        # Fallback: 用 /proc/sys/kernel/random/uuid 截取
         sid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | head -c 16)
     fi
     if [[ -z "$sid" || ${#sid} -lt 16 ]]; then
-        # 最终 fallback: python3 生成
         sid=$(python3 -c "import secrets; print(secrets.token_hex(8))" 2>/dev/null)
     fi
     echo "$sid"
+}
+
+# 生成多个 shortId (空格分隔)
+gen_short_ids() {
+    local count="${1:-4}"
+    local ids=""
+    for ((i=0; i<count; i++)); do
+        local sid
+        sid=$(gen_short_id)
+        [[ -n "$sid" ]] && ids="${ids}${ids:+ }${sid}"
+    done
+    echo "$ids"
+}
+
+# 生成随机邮箱 (8位随机字母数字)
+gen_random_email() {
+    local chars="abcdefghijklmnopqrstuvwxyz0123456789"
+    local name=""
+    for ((i=0; i<8; i++)); do
+        name+="${chars:RANDOM%${#chars}:1}"
+    done
+    echo "$name"
+}
+
+# 生成随机高端口 (10000-65535, 避开已占用)
+gen_random_port() {
+    local port attempts=0
+    while ((attempts < 20)); do
+        port=$((RANDOM % 55536 + 10000))
+        # 检查端口是否被占用
+        if ! ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+            echo "$port"
+            return 0
+        fi
+        ((attempts++))
+    done
+    # fallback: 用固定值
+    echo "10443"
 }
 
 gen_uuid() {
@@ -829,17 +865,25 @@ build_clients_json() {
 }
 
 generate_xray_config() {
-    local port sni private_key short_id dest
+    local port sni private_key short_ids dest
     port=$(db_get_field '.port')
     sni=$(db_get_field '.sni')
     private_key=$(cat "$CFG/private.key" 2>/dev/null || db_get_field '.private_key')
-    short_id=$(db_get_field '.short_id')
+    short_ids=$(db_get_field '.short_ids')
+    # 兼容旧版: 如果 short_ids 不存在，回退到 short_id
+    if [[ -z "$short_ids" ]]; then
+        short_ids=$(db_get_field '.short_id')
+    fi
     dest="${sni}:443"
 
     [[ -z "$port" ]] && { _err "未设置端口"; return 1; }
     [[ -z "$sni" ]] && { _err "未设置 SNI 域名"; return 1; }
     [[ -z "$private_key" ]] && { _err "未设置私钥"; return 1; }
-    [[ -z "$short_id" ]] && { _err "未设置 shortId"; return 1; }
+    [[ -z "$short_ids" ]] && { _err "未设置 shortId"; return 1; }
+
+    # 将空格分隔的 shortIds 转为 JSON 数组
+    local short_ids_json
+    short_ids_json=$(echo "$short_ids" | tr ' ' '\n' | jq -R . | jq -s .)
 
     local clients
     clients=$(build_clients_json)
@@ -853,7 +897,7 @@ generate_xray_config() {
         --argjson clients "$clients" \
         --arg sni "$sni" \
         --arg private_key "$private_key" \
-        --arg short_id "$short_id" \
+        --argjson short_ids "$short_ids_json" \
         --arg dest "$dest" \
     '{
         log: {loglevel: "warning"},
@@ -874,7 +918,7 @@ generate_xray_config() {
                     xver: 0,
                     serverNames: [$sni],
                     privateKey: $private_key,
-                    shortIds: [$short_id]
+                    shortIds: $short_ids
                 }
             },
             sniffing: {enabled: true, destOverride: ["http","tls"]},
@@ -1220,17 +1264,17 @@ do_install() {
     # 5. 选择端口
     local port
     echo -e "  ${W}选择监听端口${NC}"
+    local random_high_port
+    random_high_port=$(gen_random_port)
     _item "1" "443 (推荐，伪装为标准 HTTPS)"
-    _item "2" "8443 (备选，避开 443 冲突)"
-    _item "3" "10000 (高位端口，更隐蔽)"
+    _item "2" "${random_high_port} (随机高端口)"
     _item "c" "自定义端口"
     _line
     read -rp "  请选择 [默认 1]: " port_choice
     port_choice=${port_choice:-1}
     case "$port_choice" in
         1) port=443 ;;
-        2) port=8443 ;;
-        3) port=10000 ;;
+        2) port=$random_high_port ;;
         c|C)
             read -rp "  输入端口号 (1-65535): " port
             [[ ! "$port" =~ ^[0-9]+$ || "$port" -lt 1 || "$port" -gt 65535 ]] && {
@@ -1253,38 +1297,38 @@ do_install() {
     _info "SNI: $sni"
     echo ""
 
-    # 7. 生成 shortId
-    local short_id
-    short_id=$(gen_short_id)
-    _info "ShortId: $short_id"
+    # 7. 生成 shortIds (4 个, 客户端任选一个)
+    local short_ids
+    short_ids=$(gen_short_ids 4)
+    local first_short_id
+    first_short_id=$(echo "$short_ids" | awk '{print $1}')
+    _info "ShortIds: $short_ids"
 
     # 8. 生成默认用户
-    local default_uuid
+    local default_uuid default_email
     default_uuid=$(gen_uuid)
+    default_email=$(gen_random_email)
     _info "默认 UUID: $default_uuid"
     echo ""
 
     # 9. 保存配置到数据库
     db_set_field --arg port "$port" --arg sni "$sni" \
         --arg pk "$private_key" --arg pub "$public_key" \
-        --arg sid "$short_id" --arg uuid "$default_uuid" \
+        --arg sids "$short_ids" --arg sid "$first_short_id" \
+        --arg uuid "$default_uuid" --arg email "$default_email" \
         --arg dest "${sni}:443" \
-        '.port=($port|tonumber) | .sni=$sni | .private_key=$pk | .public_key=$pub | .short_id=$sid | .default_uuid=$uuid | .dest=$dest'
+        '.port=($port|tonumber) | .sni=$sni | .private_key=$pk | .public_key=$pub | .short_ids=$sids | .short_id=$sid | .default_uuid=$uuid | .default_email=$email | .dest=$dest'
 
     # 10. 创建默认用户文件
     mkdir -p "$USERS_DIR"
     local created
     created=$(date '+%Y-%m-%d %H:%M')
-    cat > "$USERS_DIR/default.json" <<EOF
-{
-  "email": "default",
-  "uuid": "$default_uuid",
-  "enabled": true,
-  "quota_gb": 0,
-  "used_bytes": 0,
-  "created": "$created"
-}
-EOF
+    jq -n \
+        --arg email "$default_email" \
+        --arg uuid "$default_uuid" \
+        --arg created "$created" \
+        '{email: $email, uuid: $uuid, enabled: true, quota_gb: 0, used_bytes: 0, created: $created}' \
+        > "$USERS_DIR/${default_email}.json"
 
     # 11. 生成 Xray 配置 (监听 127.0.0.1:8443)
     generate_xray_config || { _err "配置生成失败"; return 1; }
@@ -1333,7 +1377,7 @@ EOF
     echo ""
     echo -e "  ${W}分享链接:${NC}"
     local link
-    link="vless://${default_uuid}@${ipv4}:${port}?encryption=none&security=reality&type=tcp&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&flow=xtls-rprx-vision#VLESS-Reality"
+    link="vless://${default_uuid}@${ipv4}:${port}?encryption=none&security=reality&type=tcp&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${first_short_id}&flow=xtls-rprx-vision#VLESS-Reality"
     echo -e "  ${G}${link}${NC}"
     echo ""
 
