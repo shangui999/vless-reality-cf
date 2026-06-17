@@ -14,7 +14,7 @@ VLESS Reality 偷 Cloudflare CDN 域名一键部署脚本。
 ## 快速安装
 
 ```bash
-wget -O vless-reality-cf.sh https://raw.githubusercontent.com/shangui999/vless-reality-cf/main/vless-reality-cf.sh
+wget -O vless-reality-cf.sh https://raw.githubusercontent.com/shangui999/vless-reality-cf/master/vless-reality-cf.sh
 chmod +x vless-reality-cf.sh
 sudo ./vless-reality-cf.sh
 ```
