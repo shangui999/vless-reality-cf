@@ -98,7 +98,6 @@ sudo ./vless-reality-cf.sh
 -> 选 2 (添加用户)
 -> 输入名字: xiaoming
 -> 输入邮箱: xiaoming
--> 流量配额: 0 (不限)
 -> 选 5 (看分享链接)
 -> 把 xiaoming 的 vless:// 链接发给他
 ```

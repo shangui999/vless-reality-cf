@@ -953,13 +953,12 @@ list_users() {
     if [[ -d "$USERS_DIR" ]]; then
         for user_file in "$USERS_DIR"/*.json; do
             [[ -f "$user_file" ]] || continue
-            local name email uuid enabled created quota
+            local name email uuid enabled created
             name=$(basename "$user_file" .json)
             email=$(jq -r '.email // "user"' "$user_file")
             uuid=$(jq -r '.uuid' "$user_file")
             enabled=$(jq -r '.enabled // true' "$user_file")
             created=$(jq -r '.created // "N/A"' "$user_file")
-            quota=$(jq -r '.quota_gb // 0' "$user_file")
 
             local status_icon status_text
             if [[ "$enabled" == "true" ]]; then
@@ -972,7 +971,7 @@ list_users() {
 
             echo -e "  $status_icon ${W}${name}${NC}  (${email})"
             echo -e "     UUID: ${D}${uuid:0:8}...${uuid: -8}${NC}"
-            echo -e "     状态: $status_text | 配额: ${quota}GB | 创建: ${created}"
+            echo -e "     状态: $status_text | 创建: ${created}"
             _line
             ((count++))
         done
@@ -990,7 +989,7 @@ add_user() {
     echo -e "  ${W}添加用户${NC}"
     _line
 
-    local name email uuid quota_gb
+    local name email uuid
 
     read -rp "  用户名 (英文，用于标识): " name
     name=$(echo "$name" | xargs | tr ' ' '-')
@@ -1013,10 +1012,6 @@ add_user() {
         return 1
     fi
 
-    read -rp "  流量配额 (GB, 0=不限): " quota_gb
-    quota_gb=${quota_gb:-0}
-    [[ ! "$quota_gb" =~ ^[0-9]+$ ]] && quota_gb=0
-
     local created
     created=$(date '+%Y-%m-%d %H:%M')
 
@@ -1024,9 +1019,8 @@ add_user() {
     jq -n \
         --arg email "$email" \
         --arg uuid "$uuid" \
-        --argjson quota "$quota_gb" \
         --arg created "$created" \
-        '{email: $email, uuid: $uuid, enabled: true, quota_gb: $quota, used_bytes: 0, created: $created}' \
+        '{email: $email, uuid: $uuid, enabled: true, created: $created}' \
         > "$USERS_DIR/${name}.json"
 
     _ok "用户 $name 已添加"
@@ -1327,7 +1321,7 @@ do_install() {
         --arg email "$default_email" \
         --arg uuid "$default_uuid" \
         --arg created "$created" \
-        '{email: $email, uuid: $uuid, enabled: true, quota_gb: 0, used_bytes: 0, created: $created}' \
+        '{email: $email, uuid: $uuid, enabled: true, created: $created}' \
         > "$USERS_DIR/${default_email}.json"
 
     # 11. 生成 Xray 配置 (监听 127.0.0.1:8443)
