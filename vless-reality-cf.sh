@@ -448,12 +448,17 @@ gen_keys() {
     _info "生成 Reality 密钥对..."
     local keys
     keys=$("$XRAY_BIN" x25519 2>/dev/null)
+
+    # 兼容新旧输出格式:
+    #   旧版: "Private key: xxx" / "Public key: xxx"
+    #   新版: "PrivateKey: xxx" / "Password (PublicKey): xxx"
     local private_key public_key
-    private_key=$(echo "$keys" | grep "Private" | awk '{print $3}')
-    public_key=$(echo "$keys" | grep "Public" | awk '{print $3}')
+    private_key=$(echo "$keys" | grep -i "private" | head -1 | awk '{print $NF}')
+    public_key=$(echo "$keys" | grep -i "public" | head -1 | awk '{print $NF}')
 
     if [[ -z "$private_key" || -z "$public_key" ]]; then
-        _err "密钥生成失败"
+        _err "密钥生成失败 (xray x25519 输出异常)"
+        _err "原始输出: $keys"
         return 1
     fi
 
