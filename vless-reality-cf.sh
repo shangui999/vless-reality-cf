@@ -65,7 +65,7 @@ _item()  { echo -e "  ${G}$1${NC}) $2"; }
 _pause() { echo ""; read -rp "  按回车继续..."; }
 
 _header() {
-    clear; echo ""
+    clear 2>/dev/null || true; echo ""
     _dline
     echo -e "    ${W}VLESS Reality${NC} ${D}+${NC} ${C}CF CDN${NC}  ${D}v${VERSION}${NC}"
     echo -e "    ${D}偷域名 + SNI校验 + 用户管理${NC}"
@@ -469,7 +469,14 @@ gen_keys() {
 gen_short_id() {
     local sid
     sid=$(head -c 8 /dev/urandom 2>/dev/null | od -A n -t x1 | tr -d ' \n' | head -c 16)
-    [[ -z "$sid" ]] && sid=$(printf '%016x' $RANDOM$RANDOM$RANDOM$RANDOM)
+    if [[ -z "$sid" || ${#sid} -lt 16 ]]; then
+        # Fallback: 用 /proc/sys/kernel/random/uuid 截取
+        sid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | head -c 16)
+    fi
+    if [[ -z "$sid" || ${#sid} -lt 16 ]]; then
+        # 最终 fallback: python3 生成
+        sid=$(python3 -c "import secrets; print(secrets.token_hex(8))" 2>/dev/null)
+    fi
     echo "$sid"
 }
 
@@ -943,16 +950,14 @@ add_user() {
     local created
     created=$(date '+%Y-%m-%d %H:%M')
 
-    cat > "$USERS_DIR/${name}.json" <<EOF
-{
-  "email": "$email",
-  "uuid": "$uuid",
-  "enabled": true,
-  "quota_gb": $quota_gb,
-  "used_bytes": 0,
-  "created": "$created"
-}
-EOF
+    # 用 jq 构建 JSON，防止用户输入特殊字符导致 JSON 注入
+    jq -n \
+        --arg email "$email" \
+        --arg uuid "$uuid" \
+        --argjson quota "$quota_gb" \
+        --arg created "$created" \
+        '{email: $email, uuid: $uuid, enabled: true, quota_gb: $quota, used_bytes: 0, created: $created}' \
+        > "$USERS_DIR/${name}.json"
 
     _ok "用户 $name 已添加"
     echo -e "  ${D}UUID: $uuid${NC}"
@@ -1251,8 +1256,11 @@ EOF
     svc status vless-reality 2>/dev/null | grep -qi "running\|active" && \
         _ok "Xray 服务已启动" || _warn "Xray 启动异常"
 
-    # 停止 Nginx 默认 80 监听 (避免冲突)，启动 SNI 分流
-    # 先停掉可能占用 443 的服务
+    # 停止 Nginx 默认站点 (避免端口冲突)，启动 SNI 分流
+    # 清理默认站点配置 (Debian/Ubuntu 的 default site 可能占用 80/443)
+    rm -f /etc/nginx/sites-enabled/default 2>/dev/null
+    rm -f /etc/nginx/conf.d/default.conf 2>/dev/null
+    # 停掉可能占用端口的 nginx
     svc stop nginx 2>/dev/null
     sleep 1
     svc start nginx
@@ -1389,7 +1397,9 @@ change_port() {
     db_set_field --arg p "$new_port" '.port=($p|tonumber)'
     _ok "端口已改为 $new_port"
 
+    # 同时更新 Xray 和 Nginx SNI 配置 (Nginx 监听端口也需同步)
     if generate_xray_config 2>/dev/null; then
+        generate_nginx_sni_config 2>/dev/null
         restart_xray
     fi
 }
@@ -1506,7 +1516,14 @@ enable_bbr() {
     fi
 
     _info "启用 BBR..."
-    # 设置内核参数
+
+    # 幂等写入：先删除旧的 BBR 配置行，再追加
+    if [[ -f /etc/sysctl.conf ]]; then
+        sed -i '/^net\.core\.default_qdisc=fq$/d' /etc/sysctl.conf 2>/dev/null
+        sed -i '/^net\.ipv4\.tcp_congestion_control=bbr$/d' /etc/sysctl.conf 2>/dev/null
+        sed -i '/^# BBR$/d' /etc/sysctl.conf 2>/dev/null
+    fi
+
     cat >> /etc/sysctl.conf <<'EOF'
 # BBR
 net.core.default_qdisc=fq
