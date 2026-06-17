@@ -749,19 +749,22 @@ check_sni_validity() {
 }
 
 # 选择 SNI 域名的交互菜单
-# ⚠️ 此函数通过 echo 返回值 (域名)，所有 UI 输出必须走 stderr (>&2)
-#   否则 sni=$(select_sni_domain) 会把菜单文字也捕获进 sni 变量
+# 结果通过全局变量 SELECTED_SNI 返回 (不用 echo，避免子 shell 捕获 stdout 的问题)
+# 返回 0 = 成功选中, 1 = 取消/重试
+SELECTED_SNI=""
+
 select_sni_domain() {
-    echo "" >&2
+    SELECTED_SNI=""
+    echo ""
     _line
-    echo -e "  ${W}选择 Reality SNI 域名 (偷哪个域名)${NC}" >&2
-    echo "" >&2
-    echo -e "  ${D}选择原则:${NC}" >&2
-    echo -e "  ${D}• 部署在 Cloudflare CDN 上的站点${NC}" >&2
-    echo -e "  ${D}• 在大陆可访问 (避免被墙)${NC}" >&2
-    echo -e "  ${D}• 支持 TLS 1.3${NC}" >&2
-    echo -e "  ${D}• 不要太热门/敏感 (避免被重点关注)${NC}" >&2
-    echo "" >&2
+    echo -e "  ${W}选择 Reality SNI 域名 (偷哪个域名)${NC}"
+    echo ""
+    echo -e "  ${D}选择原则:${NC}"
+    echo -e "  ${D}• 部署在 Cloudflare CDN 上的站点${NC}"
+    echo -e "  ${D}• 在大陆可访问 (避免被墙)${NC}"
+    echo -e "  ${D}• 支持 TLS 1.3${NC}"
+    echo -e "  ${D}• 不要太热门/敏感 (避免被重点关注)${NC}"
+    echo ""
     _line
 
     local i=1
@@ -778,19 +781,18 @@ select_sni_domain() {
         ((i++))
     done
     _item "c" "自定义域名 (输入后自动校验)"
-    _item "v" "对已选域名执行 SNI 校验"
     _item "0" "返回"
     _line
 
     local choice
-    read -rp "  请选择 [默认 1: speed.cloudflare.com]: " choice >&2
+    read -rp "  请选择 [默认 1: speed.cloudflare.com]: " choice
     choice=${choice:-1}
 
     if [[ "$choice" == "c" || "$choice" == "C" ]]; then
-        echo "" >&2
+        echo ""
         local custom_domain
-        read -rp "  输入自定义域名: " custom_domain >&2
-        custom_domain=$(echo "$custom_domain" | xargs) # trim
+        read -rp "  输入自定义域名: " custom_domain
+        custom_domain=$(echo "$custom_domain" | xargs)
 
         if [[ -z "$custom_domain" ]]; then
             _err "域名不能为空"
@@ -802,40 +804,27 @@ select_sni_domain() {
             return 1
         fi
 
-        # 自动校验 (check_sni_validity 输出也走 stderr)
-        check_sni_validity "$custom_domain" >&2 || true
-        echo "" >&2
-        echo -e "  ${Y}是否使用此域名? [Y/n]: ${NC}" >&2
-        read -rp "  " confirm >&2
+        # 自动校验
+        check_sni_validity "$custom_domain" || true
+        echo ""
+        read -rp "  使用此域名? [Y/n]: " confirm
         if [[ "${confirm,,}" == "n" ]]; then
             return 1
         fi
-        echo "$custom_domain"
+        SELECTED_SNI="$custom_domain"
         return 0
-    elif [[ "$choice" == "v" || "$choice" == "V" ]]; then
-        local current_sni
-        current_sni=$(db_get_field '.sni')
-        if [[ -z "$current_sni" ]]; then
-            _warn "尚未设置 SNI 域名，请先选择一个"
-            _pause
-            return 1
-        fi
-        check_sni_validity "$current_sni" >&2
-        _pause
-        return 1
     elif [[ "$choice" == "0" ]]; then
         return 1
     elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#CF_CDN_DOMAINS[@]} ]]; then
         local selected="${CF_CDN_DOMAINS[$((choice-1))]}"
-        echo "" >&2
+        echo ""
         _info "已选择: $selected"
-        echo "" >&2
-        echo -e "  ${Y}是否现在执行 SNI 校验? [Y/n]: ${NC}" >&2
-        read -rp "  " do_check >&2
+        echo ""
+        read -rp "  执行 SNI 校验? [Y/n]: " do_check
         if [[ "${do_check,,}" != "n" ]]; then
-            check_sni_validity "$selected" >&2
+            check_sni_validity "$selected"
         fi
-        echo "$selected"
+        SELECTED_SNI="$selected"
         return 0
     else
         _err "无效选择"
@@ -1300,7 +1289,9 @@ do_install() {
     echo -e "  ${W}选择 SNI 伪装域名 (偷 CF CDN 域名)${NC}"
     local sni=""
     while [[ -z "$sni" ]]; do
-        sni=$(select_sni_domain) || true
+        if select_sni_domain; then
+            sni="$SELECTED_SNI"
+        fi
     done
     _info "SNI: $sni"
     echo ""
@@ -1508,13 +1499,16 @@ change_sni() {
 
     local new_sni=""
     while [[ -z "$new_sni" ]]; do
-        new_sni=$(select_sni_domain) || true
+        if select_sni_domain; then
+            new_sni="$SELECTED_SNI"
+        fi
     done
 
     db_set_field --arg s "$new_sni" --arg d "${new_sni}:443" '.sni=$s | .dest=$d'
     _ok "SNI 已改为 $new_sni"
 
     if generate_xray_config 2>/dev/null; then
+        generate_nginx_sni_config 2>/dev/null
         restart_xray
     fi
 }
