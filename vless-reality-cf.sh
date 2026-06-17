@@ -16,6 +16,8 @@ readonly CFG="/etc/vless-reality-cf"
 readonly DB_FILE="$CFG/db.json"
 readonly XRAY_BIN="/usr/local/bin/xray"
 readonly XRAY_CONFIG="$CFG/xray.json"
+readonly XRAY_INTERNAL_PORT=8443
+readonly NGINX_SNI_CONF="/etc/nginx/stream.conf.d/vless-reality-sni.conf"
 readonly USERS_DIR="$CFG/users"
 
 # 颜色
@@ -207,6 +209,10 @@ restart_xray() {
     else
         _warn "Xray 重启后状态异常，请检查日志"
     fi
+    # 同时重启 Nginx (SNI 分流)
+    if check_cmd nginx; then
+        restart_nginx
+    fi
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -234,6 +240,141 @@ install_deps() {
             ;;
     esac
     _ok "依赖安装完成"
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+#  Nginx 安装 + SNI 分流 (防 CF CDN 流量被盗刷)
+#
+#  原理: https://github.com/XTLS/Xray-core/issues/2360
+#  Reality dest 设为 CF CDN 域名时，非 Reality 流量会被转发到 CF Edge IP，
+#  导致 VPS 变成免费 CF CDN 中转节点。
+#  解决方案: Nginx stream 层 SNI 分流，只允许目标 SNI 的流量进入 Xray，
+#  其他 SNI 直接黑洞，从根源阻断薅羊毛。
+#═══════════════════════════════════════════════════════════════════════════════
+
+install_nginx() {
+    if check_cmd nginx; then
+        # 检查是否有 stream 模块
+        if nginx -V 2>&1 | grep -q "with-stream"; then
+            _ok "Nginx 已安装 (含 stream 模块)"
+            return 0
+        else
+            _warn "Nginx 已安装但缺少 stream 模块，重新安装..."
+        fi
+    fi
+
+    _info "安装 Nginx (需要 stream 模块用于 SNI 分流)..."
+    case "$DISTRO" in
+        alpine)
+            apk add --no-cache nginx nginx-stream >/dev/null 2>&1 || \
+            apk add --no-cache nginx >/dev/null 2>&1
+            ;;
+        centos)
+            yum install -y -q nginx >/dev/null 2>&1
+            ;;
+        debian|ubuntu)
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx >/dev/null 2>&1
+            ;;
+    esac
+
+    if check_cmd nginx; then
+        _ok "Nginx 安装完成"
+    else
+        _err "Nginx 安装失败"
+        return 1
+    fi
+}
+
+generate_nginx_sni_config() {
+    local sni port
+    sni=$(db_get_field '.sni')
+    port=$(db_get_field '.port')
+    [[ -z "$sni" ]] && { _err "未设置 SNI"; return 1; }
+    [[ -z "$port" ]] && port=443
+
+    mkdir -p "$(dirname "$NGINX_SNI_CONF")"
+
+    cat > "$NGINX_SNI_CONF" <<EOF
+# VLESS Reality SNI 分流 - 防 CF CDN 流量被盗刷
+# 只有 SNI 匹配 $sni 的流量才转发到 Xray (127.0.0.1:$XRAY_INTERNAL_PORT)
+# 其他 SNI 一律黑洞，防止 VPS 被当作免费 CF CDN 中转
+# 参考: https://github.com/XTLS/Xray-core/issues/2360
+
+# SNI 映射表: 匹配目标域名 → Xray，其他 → 丢弃
+map \$ssl_preread_server_name \$sni_backend {
+    $sni              xray_backend;
+    default           drop_backend;
+}
+
+# 后端定义
+upstream xray_backend {
+    server 127.0.0.1:$XRAY_INTERNAL_PORT;
+}
+
+# 黑洞后端 (连接直接关闭，不消耗流量)
+upstream drop_backend {
+    server 127.0.0.1:1;  # 无效地址，连接立即失败
+}
+
+# 监听 443 端口，SSL 预读 SNI，不终止 TLS
+server {
+    listen $port;
+    listen [::]:$port;
+    ssl_preread on;
+    proxy_protocol off;
+    proxy_pass \$sni_backend;
+
+    # 超时设置
+    proxy_timeout 300s;
+    proxy_connect_timeout 5s;
+}
+EOF
+
+    _ok "Nginx SNI 分流配置已生成: $NGINX_SNI_CONF"
+
+    # 确保 nginx.conf 包含 stream.conf.d
+    if ! grep -q "stream.conf.d" /etc/nginx/nginx.conf 2>/dev/null; then
+        # 在 nginx.conf 末尾 } 前插入 stream block
+        if grep -q "^}" /etc/nginx/nginx.conf; then
+            # 在最后 } 前插入
+            sed -i '/^}/i \
+# SNI stream 分流 (VLESS Reality)\
+stream {\
+    include /etc/nginx/stream.conf.d/*.conf;\
+}' /etc/nginx/nginx.conf 2>/dev/null || {
+                # sed 失败，手动追加
+                echo "" >> /etc/nginx/nginx.conf
+                echo "stream {" >> /etc/nginx/nginx.conf
+                echo "    include /etc/nginx/stream.conf.d/*.conf;" >> /etc/nginx/nginx.conf
+                echo "}" >> /etc/nginx/nginx.conf
+            }
+            _ok "已在 nginx.conf 中添加 stream block"
+        fi
+    fi
+}
+
+create_nginx_service() {
+    if [[ "$DISTRO" != "alpine" ]]; then
+        systemctl enable nginx 2>/dev/null
+    else
+        rc-update add nginx default 2>/dev/null
+    fi
+}
+
+restart_nginx() {
+    # 先测试配置
+    if nginx -t 2>&1 | grep -q "successful"; then
+        svc restart nginx
+        sleep 1
+        if svc status nginx 2>/dev/null | grep -qi "running\|active"; then
+            _ok "Nginx 已重启 (SNI 分流生效)"
+        else
+            _warn "Nginx 重启后状态异常"
+        fi
+    else
+        _err "Nginx 配置测试失败:"
+        nginx -t 2>&1 | tail -5
+    fi
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -674,7 +815,7 @@ generate_xray_config() {
     tmp=$(mktemp)
 
     jq -n \
-        --argjson port "$port" \
+        --argjson internal_port "$XRAY_INTERNAL_PORT" \
         --argjson clients "$clients" \
         --arg sni "$sni" \
         --arg private_key "$private_key" \
@@ -683,13 +824,12 @@ generate_xray_config() {
     '{
         log: {loglevel: "warning"},
         inbounds: [{
-            port: $port,
-            listen: "0.0.0.0",
+            port: $internal_port,
+            listen: "127.0.0.1",
             protocol: "vless",
             settings: {
                 clients: $clients,
-                decryption: "none",
-                fallbacks: [{"dest": "127.0.0.1:80", "xver": 0}]
+                decryption: "none"
             },
             streamSettings: {
                 network: "tcp",
@@ -1034,6 +1174,9 @@ do_install() {
     # 3. 安装 Xray
     install_xray || { _err "Xray 安装失败"; return 1; }
 
+    # 3.5 安装 Nginx (SNI 分流防薅)
+    install_nginx || { _err "Nginx 安装失败"; return 1; }
+
     # 4. 生成密钥
     init_db
     gen_keys
@@ -1093,21 +1236,39 @@ do_install() {
 }
 EOF
 
-    # 11. 生成 Xray 配置
+    # 11. 生成 Xray 配置 (监听 127.0.0.1:8443)
     generate_xray_config || { _err "配置生成失败"; return 1; }
+
+    # 11.5 生成 Nginx SNI 分流配置 (监听 0.0.0.0:443)
+    generate_nginx_sni_config || { _err "Nginx SNI 配置生成失败"; return 1; }
+    create_nginx_service
 
     # 12. 创建并启动服务
     create_xray_service
     svc start vless-reality
     sleep 1
     svc status vless-reality 2>/dev/null | grep -qi "running\|active" && \
-        _ok "服务已启动" || _warn "服务启动异常"
+        _ok "Xray 服务已启动" || _warn "Xray 启动异常"
+
+    # 停止 Nginx 默认 80 监听 (避免冲突)，启动 SNI 分流
+    # 先停掉可能占用 443 的服务
+    svc stop nginx 2>/dev/null
+    sleep 1
+    svc start nginx
+    sleep 1
+    svc status nginx 2>/dev/null | grep -qi "running\|active" && \
+        _ok "Nginx SNI 分流已启动" || _warn "Nginx 启动异常"
 
     # 13. 显示结果
     echo ""
     _dline
     echo -e "  ${G}安装完成!${NC}"
     _dline
+    echo ""
+    echo -e "  ${W}架构: Nginx (SNI分流) → Xray (Reality)${NC}"
+    echo -e "  ${D}• Nginx 监听 443，SNI 匹配 $sni → 转发 Xray${NC}"
+    echo -e "  ${D}• 其他 SNI → 黑洞 (防 CF CDN 流量被盗刷)${NC}"
+    echo -e "  ${D}• 参考: github.com/XTLS/Xray-core/issues/2360${NC}"
     echo ""
     echo -e "  ${W}连接信息:${NC}"
     echo -e "  服务器: $ipv4"
@@ -1139,10 +1300,20 @@ show_status() {
     public_key=$(cat "$CFG/public.key" 2>/dev/null || true)
     ipv4=$(get_ipv4)
 
-    # 服务状态
-    local svc_status="${R}未运行${NC}"
+    # Xray 服务状态
+    local xray_status="${R}未运行${NC}"
     if svc status vless-reality 2>/dev/null | grep -qi "running\|active"; then
-        svc_status="${G}运行中${NC}"
+        xray_status="${G}运行中${NC}"
+    fi
+
+    # Nginx SNI 分流状态
+    local nginx_status="${D}未安装${NC}"
+    if check_cmd nginx; then
+        if svc status nginx 2>/dev/null | grep -qi "running\|active"; then
+            nginx_status="${G}运行中${NC} ${D}(SNI分流)${NC}"
+        else
+            nginx_status="${R}未运行${NC}"
+        fi
     fi
 
     # Xray 版本
@@ -1151,8 +1322,8 @@ show_status() {
         xray_ver=$(xray version 2>/dev/null | head -n1 | awk '{print $2}')
     fi
 
-    echo -e "  服务状态: $svc_status"
-    echo -e "  Xray:     ${D}v${xray_ver}${NC}"
+    echo -e "  Xray:     $xray_status ${D}v${xray_ver}${NC}"
+    echo -e "  Nginx:    $nginx_status"
     [[ -n "$port" ]] && echo -e "  端口:     $port"
     [[ -n "$sni" ]]  && echo -e "  SNI:      $sni"
     [[ -n "$ipv4" ]] && echo -e "  IPv4:     $ipv4"
@@ -1266,14 +1437,15 @@ rotate_keys() {
 
 do_uninstall() {
     echo -e "  ${R}即将完全卸载 VLESS Reality CF${NC}"
-    echo -e "  ${Y}将删除: Xray 配置、用户数据、服务${NC}"
+    echo -e "  ${Y}将删除: Xray 配置、用户数据、Nginx SNI 配置、服务${NC}"
     read -rp "  确认卸载? [y/N]: " confirm
     [[ "${confirm,,}" != "y" ]] && return
 
     _info "停止服务..."
     svc stop vless-reality 2>/dev/null
+    svc stop nginx 2>/dev/null
 
-    _info "移除服务..."
+    _info "移除 Xray 服务..."
     if [[ "$DISTRO" == "alpine" ]]; then
         rc-update del vless-reality default 2>/dev/null
         rm -f /etc/init.d/vless-reality
@@ -1283,6 +1455,14 @@ do_uninstall() {
         systemctl daemon-reload 2>/dev/null
     fi
 
+    _info "移除 Nginx SNI 分流配置..."
+    rm -f "$NGINX_SNI_CONF"
+    # 从 nginx.conf 中移除 stream block
+    if [[ -f /etc/nginx/nginx.conf ]]; then
+        sed -i '/# SNI stream 分流/,/^}/d' /etc/nginx/nginx.conf 2>/dev/null
+        sed -i '/include.*stream\.conf\.d/d' /etc/nginx/nginx.conf 2>/dev/null
+    fi
+
     _info "删除二进制..."
     rm -f "$XRAY_BIN"
 
@@ -1290,7 +1470,7 @@ do_uninstall() {
     rm -rf "$CFG"
 
     _ok "卸载完成"
-    _warn "Xray 二进制文件已删除，如需保留请手动恢复"
+    _warn "Xray 已删除，Nginx 保留 (可能还有其他用途)"
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
