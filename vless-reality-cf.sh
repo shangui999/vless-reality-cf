@@ -1363,9 +1363,9 @@ do_install() {
     _dline
     echo ""
     echo -e "  ${W}架构: Nginx (SNI分流) → Xray (Reality)${NC}"
-    echo -e "  ${D}• Nginx 监听 443，SNI 匹配 $sni → 转发 Xray${NC}"
+    echo -e "  ${D}• Nginx 监听 $port，SNI 匹配 $sni → 转发 Xray${NC}"
+    echo -e "  ${D}• Xray 监听 127.0.0.1:$XRAY_INTERNAL_PORT (仅本地)${NC}"
     echo -e "  ${D}• 其他 SNI → 黑洞 (防 CF CDN 流量被盗刷)${NC}"
-    echo -e "  ${D}• 参考: github.com/XTLS/Xray-core/issues/2360${NC}"
     echo ""
     echo -e "  ${W}连接信息:${NC}"
     echo -e "  服务器: $ipv4"
