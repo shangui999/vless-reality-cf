@@ -749,17 +749,19 @@ check_sni_validity() {
 }
 
 # 选择 SNI 域名的交互菜单
+# ⚠️ 此函数通过 echo 返回值 (域名)，所有 UI 输出必须走 stderr (>&2)
+#   否则 sni=$(select_sni_domain) 会把菜单文字也捕获进 sni 变量
 select_sni_domain() {
-    echo ""
+    echo "" >&2
     _line
-    echo -e "  ${W}选择 Reality SNI 域名 (偷哪个域名)${NC}"
-    echo ""
-    echo -e "  ${D}选择原则:${NC}"
-    echo -e "  ${D}• 部署在 Cloudflare CDN 上的站点${NC}"
-    echo -e "  ${D}• 在大陆可访问 (避免被墙)${NC}"
-    echo -e "  ${D}• 支持 TLS 1.3${NC}"
-    echo -e "  ${D}• 不要太热门/敏感 (避免被重点关注)${NC}"
-    echo ""
+    echo -e "  ${W}选择 Reality SNI 域名 (偷哪个域名)${NC}" >&2
+    echo "" >&2
+    echo -e "  ${D}选择原则:${NC}" >&2
+    echo -e "  ${D}• 部署在 Cloudflare CDN 上的站点${NC}" >&2
+    echo -e "  ${D}• 在大陆可访问 (避免被墙)${NC}" >&2
+    echo -e "  ${D}• 支持 TLS 1.3${NC}" >&2
+    echo -e "  ${D}• 不要太热门/敏感 (避免被重点关注)${NC}" >&2
+    echo "" >&2
     _line
 
     local i=1
@@ -781,13 +783,13 @@ select_sni_domain() {
     _line
 
     local choice
-    read -rp "  请选择 [默认 1: speed.cloudflare.com]: " choice
+    read -rp "  请选择 [默认 1: speed.cloudflare.com]: " choice >&2
     choice=${choice:-1}
 
     if [[ "$choice" == "c" || "$choice" == "C" ]]; then
-        echo ""
+        echo "" >&2
         local custom_domain
-        read -rp "  输入自定义域名: " custom_domain
+        read -rp "  输入自定义域名: " custom_domain >&2
         custom_domain=$(echo "$custom_domain" | xargs) # trim
 
         if [[ -z "$custom_domain" ]]; then
@@ -800,11 +802,11 @@ select_sni_domain() {
             return 1
         fi
 
-        # 自动校验
-        check_sni_validity "$custom_domain" || true
-        echo ""
-        echo -e "  ${Y}是否使用此域名? [Y/n]: ${NC}"
-        read -rp "  " confirm
+        # 自动校验 (check_sni_validity 输出也走 stderr)
+        check_sni_validity "$custom_domain" >&2 || true
+        echo "" >&2
+        echo -e "  ${Y}是否使用此域名? [Y/n]: ${NC}" >&2
+        read -rp "  " confirm >&2
         if [[ "${confirm,,}" == "n" ]]; then
             return 1
         fi
@@ -818,20 +820,20 @@ select_sni_domain() {
             _pause
             return 1
         fi
-        check_sni_validity "$current_sni"
+        check_sni_validity "$current_sni" >&2
         _pause
         return 1
     elif [[ "$choice" == "0" ]]; then
         return 1
     elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#CF_CDN_DOMAINS[@]} ]]; then
         local selected="${CF_CDN_DOMAINS[$((choice-1))]}"
-        echo ""
+        echo "" >&2
         _info "已选择: $selected"
-        echo ""
-        echo -e "  ${Y}是否现在执行 SNI 校验? [Y/n]: ${NC}"
-        read -rp "  " do_check
+        echo "" >&2
+        echo -e "  ${Y}是否现在执行 SNI 校验? [Y/n]: ${NC}" >&2
+        read -rp "  " do_check >&2
         if [[ "${do_check,,}" != "n" ]]; then
-            check_sni_validity "$selected"
+            check_sni_validity "$selected" >&2
         fi
         echo "$selected"
         return 0
