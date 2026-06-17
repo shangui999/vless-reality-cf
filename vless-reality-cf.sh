@@ -764,7 +764,15 @@ select_sni_domain() {
 
     local i=1
     for d in "${CF_CDN_DOMAINS[@]}"; do
-        _item "$i" "$d"
+        if [[ "$d" == "speed.cloudflare.com" ]]; then
+            _item "$i" "$d  ${Y}← 推荐${NC}"
+        elif [[ "$d" == "www.cloudflare.com" ]]; then
+            _item "$i" "$d  ${D}(CF 官网)${NC}"
+        elif [[ "$d" == "dash.cloudflare.com" ]]; then
+            _item "$i" "$d  ${D}(CF 面板)${NC}"
+        else
+            _item "$i" "$d"
+        fi
         ((i++))
     done
     _item "c" "自定义域名 (输入后自动校验)"
@@ -773,7 +781,8 @@ select_sni_domain() {
     _line
 
     local choice
-    read -rp "  请选择: " choice
+    read -rp "  请选择 [默认 1: speed.cloudflare.com]: " choice
+    choice=${choice:-1}
 
     if [[ "$choice" == "c" || "$choice" == "C" ]]; then
         echo ""
@@ -1262,9 +1271,26 @@ do_install() {
     # 5. 选择端口
     local port
     echo -e "  ${W}选择监听端口${NC}"
-    read -rp "  端口 [默认 443]: " port
-    port=${port:-443}
-    [[ ! "$port" =~ ^[0-9]+$ ]] && port=443
+    _item "1" "443 (推荐，伪装为标准 HTTPS)"
+    _item "2" "8443 (备选，避开 443 冲突)"
+    _item "3" "10000 (高位端口，更隐蔽)"
+    _item "c" "自定义端口"
+    _line
+    read -rp "  请选择 [默认 1]: " port_choice
+    port_choice=${port_choice:-1}
+    case "$port_choice" in
+        1) port=443 ;;
+        2) port=8443 ;;
+        3) port=10000 ;;
+        c|C)
+            read -rp "  输入端口号 (1-65535): " port
+            [[ ! "$port" =~ ^[0-9]+$ || "$port" -lt 1 || "$port" -gt 65535 ]] && {
+                _warn "无效端口，使用默认 443"
+                port=443
+            }
+            ;;
+        *) port=443 ;;
+    esac
     _info "端口: $port"
     echo ""
 
