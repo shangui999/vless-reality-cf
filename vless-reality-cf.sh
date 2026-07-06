@@ -78,18 +78,70 @@ _header() {
 
 get_ipv4() {
     [[ -n "$_CACHED_IPV4" ]] && { echo "$_CACHED_IPV4"; return; }
-    local result
+    local result=""
+
+    # 1. 外部 IP 服务（多个源，提高成功率）
     result=$(curl -4 -sf --connect-timeout 5 ip.sb 2>/dev/null || \
-             curl -4 -sf --connect-timeout 5 ifconfig.me 2>/dev/null || true)
+             curl -4 -sf --connect-timeout 5 ifconfig.me 2>/dev/null || \
+             curl -4 -sf --connect-timeout 5 api.ipify.org 2>/dev/null || \
+             curl -4 -sf --connect-timeout 5 icanhazip.com 2>/dev/null || true)
+
+    # 2. 回退：云平台 metadata API（外部 IP 服务被墙时很有用）
+    if [[ -z "$result" ]]; then
+        local meta_url
+        # 阿里云
+        for meta_url in \
+            "http://100.100.100.200/latest/meta-data/eipv4" \
+            "http://100.100.100.200/latest/meta-data/public-ipv4" \
+            "http://169.254.169.254/latest/meta-data/public-ipv4" \
+            "http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address"; do
+            result=$(curl -4 -sf --connect-timeout 3 "$meta_url" 2>/dev/null)
+            [[ -n "$result" ]] && break
+        done
+    fi
+
+    # 3. 回退：从默认路由接口取本地公网/内网 IP
+    if [[ -z "$result" ]]; then
+        result=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") print $(i+1)}' | head -1)
+    fi
+    # 4. 再回退：hostname -I 的第一个地址
+    if [[ -z "$result" ]]; then
+        result=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+
     [[ -n "$result" ]] && _CACHED_IPV4="$result"
     echo "$result"
 }
 
 get_ipv6() {
     [[ -n "$_CACHED_IPV6" ]] && { echo "$_CACHED_IPV6"; return; }
-    local result
+    local result=""
+
+    # 1. 外部 IP 服务
     result=$(curl -6 -sf --connect-timeout 5 ip.sb 2>/dev/null || \
-             curl -6 -sf --connect-timeout 5 ifconfig.me 2>/dev/null || true)
+             curl -6 -sf --connect-timeout 5 ifconfig.me 2>/dev/null || \
+             curl -6 -sf --connect-timeout 5 api.ipify.org 2>/dev/null || true)
+
+    # 2. 回退：云平台 metadata API
+    if [[ -z "$result" ]]; then
+        local meta_url
+        for meta_url in \
+            "http://100.100.100.200/latest/meta-data/ipv6" \
+            "http://169.254.169.254/latest/meta-data/ipv6"; do
+            result=$(curl -6 -sf --connect-timeout 3 "$meta_url" 2>/dev/null)
+            [[ -n "$result" ]] && break
+        done
+    fi
+
+    # 3. 回退：从默认路由接口取 IPv6 全球单播地址（排除链路本地）
+    if [[ -z "$result" ]]; then
+        result=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") print $(i+1)}' | head -1)
+    fi
+    # 4. 再回退：从本机接口取第一个非链路本地 IPv6
+    if [[ -z "$result" ]]; then
+        result=$(ip -6 addr show 2>/dev/null | awk '/inet6/{print $2}' | grep -v '^fe80' | head -1 | cut -d/ -f1)
+    fi
+
     [[ -n "$result" ]] && _CACHED_IPV6="$result"
     echo "$result"
 }
@@ -104,6 +156,27 @@ urlencode() {
         esac
     done
     echo "$o"
+}
+
+# 构造 vless:// 分享链接；IPv6 地址自动加 []
+build_vless_link() {
+    local uuid="$1" server="$2" port="$3" sni="$4" public_key="$5" short_id="$6" name="$7"
+    if [[ "$server" == *":"* ]]; then
+        server="[${server}]"
+    fi
+    local enc_name
+    enc_name=$(urlencode "$name")
+    echo "vless://${uuid}@${server}:${port}?encryption=none&security=reality&type=tcp&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&flow=xtls-rprx-vision#${enc_name}"
+}
+
+# 如果安装了 qrencode，输出二维码
+show_qr() {
+    local link="$1"
+    if check_cmd qrencode; then
+        echo ""
+        _info "二维码 (手机扫描):"
+        qrencode -t ANSIUTF8 "$link" 2>/dev/null || qrencode -t ANSI "$link" 2>/dev/null || true
+    fi
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -165,6 +238,16 @@ svc() {
     fi
 }
 
+# 判断服务是否正在运行（比 grep status 输出更可靠）
+is_service_active() {
+    local name="$1"
+    if [[ "$DISTRO" == "alpine" ]]; then
+        rc-service "$name" status 2>/dev/null | grep -qi "started\|running"
+    else
+        systemctl is-active --quiet "$name" 2>/dev/null
+    fi
+}
+
 create_xray_service() {
     if [[ "$DISTRO" == "alpine" ]]; then
         cat > /etc/init.d/vless-reality <<'EOF'
@@ -204,7 +287,7 @@ EOF
 restart_xray() {
     svc restart vless-reality
     sleep 1
-    if svc status vless-reality 2>/dev/null | grep -qi "running\|active"; then
+    if is_service_active vless-reality; then
         _ok "Xray 已重启"
     else
         _warn "Xray 重启后状态异常，请检查日志"
@@ -224,19 +307,19 @@ install_deps() {
     case "$DISTRO" in
         alpine)
             apk update -q 2>/dev/null
-            apk add --no-cache curl jq openssl ca-certificates coreutils unzip >/dev/null 2>&1
+            apk add --no-cache curl jq openssl ca-certificates coreutils unzip qrencode >/dev/null 2>&1
             # gcompat 兼容层
             apk add --no-cache gcompat libc6-compat >/dev/null 2>&1
             ;;
         centos)
-            yum install -y -q curl jq openssl ca-certificates coreutils unzip >/dev/null 2>&1
+            yum install -y -q curl jq openssl ca-certificates coreutils unzip qrencode >/dev/null 2>&1
             ;;
         debian|ubuntu)
             apt-get update -qq >/dev/null 2>&1
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl jq openssl ca-certificates coreutils unzip >/dev/null 2>&1
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl jq openssl ca-certificates coreutils unzip qrencode >/dev/null 2>&1
             ;;
         *)
-            _warn "未知发行版，请手动安装: curl jq openssl unzip"
+            _warn "未知发行版，请手动安装: curl jq openssl unzip qrencode"
             ;;
     esac
     _ok "依赖安装完成"
@@ -430,7 +513,7 @@ restart_nginx() {
     if nginx -t 2>&1 | grep -q "successful"; then
         svc restart nginx
         sleep 1
-        if svc status nginx 2>/dev/null | grep -qi "running\|active"; then
+        if is_service_active nginx; then
             _ok "Nginx 已重启 (SNI 分流生效)"
         else
             _warn "Nginx 重启后状态异常"
@@ -937,6 +1020,16 @@ generate_xray_config() {
     }' > "$tmp"
 
     mv "$tmp" "$XRAY_CONFIG"
+
+    # 校验配置是否合法
+    if [[ -x "$XRAY_BIN" ]]; then
+        if ! "$XRAY_BIN" -test -c "$XRAY_CONFIG" >/dev/null 2>&1; then
+            _err "Xray 配置校验失败，请检查日志:"
+            "$XRAY_BIN" -test -c "$XRAY_CONFIG" 2>&1 | tail -10
+            return 1
+        fi
+    fi
+
     _ok "Xray 配置已生成: $XRAY_CONFIG"
 }
 
@@ -1141,14 +1234,15 @@ show_user_links() {
     echo -e "  ${W}用户分享链接${NC}"
     _line
 
-    local port sni short_id public_key ipv4
+    local port sni short_id public_key ipv4 ipv6
     port=$(db_get_field '.port')
     sni=$(db_get_field '.sni')
     short_id=$(db_get_field '.short_id')
     public_key=$(cat "$CFG/public.key" 2>/dev/null || db_get_field '.public_key')
     ipv4=$(get_ipv4)
+    ipv6=$(get_ipv6)
 
-    if [[ -z "$ipv4" ]]; then
+    if [[ -z "$ipv4" && -z "$ipv6" ]]; then
         _warn "无法获取公网 IP，使用占位符"
         ipv4="YOUR_SERVER_IP"
     fi
@@ -1168,11 +1262,22 @@ show_user_links() {
 
         [[ "$enabled" != "true" ]] && continue
 
-        local link
-        link="vless://${uuid}@${ipv4}:${port}?encryption=none&security=reality&type=tcp&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&flow=xtls-rprx-vision#${name}"
-
         echo -e "  ${W}${name}${NC} (${email})"
-        echo -e "  ${G}${link}${NC}"
+
+        if [[ -n "$ipv4" ]]; then
+            local link4
+            link4=$(build_vless_link "$uuid" "$ipv4" "$port" "$sni" "$public_key" "$short_id" "$name")
+            echo -e "  ${G}IPv4: ${link4}${NC}"
+            show_qr "$link4"
+        fi
+
+        if [[ -n "$ipv6" ]]; then
+            local link6
+            link6=$(build_vless_link "$uuid" "$ipv6" "$port" "$sni" "$public_key" "$short_id" "$name")
+            echo -e "  ${G}IPv6: ${link6}${NC}"
+            show_qr "$link6"
+        fi
+
         echo ""
     done
 }
@@ -1335,8 +1440,11 @@ do_install() {
     create_xray_service
     svc start vless-reality
     sleep 1
-    svc status vless-reality 2>/dev/null | grep -qi "running\|active" && \
-        _ok "Xray 服务已启动" || _warn "Xray 启动异常"
+    if is_service_active vless-reality; then
+        _ok "Xray 服务已启动"
+    else
+        _warn "Xray 启动异常"
+    fi
 
     # 停止 Nginx 默认站点 (避免端口冲突)，启动 SNI 分流
     # 清理默认站点配置 (Debian/Ubuntu 的 default site 可能占用 80/443)
@@ -1347,10 +1455,16 @@ do_install() {
     sleep 1
     svc start nginx
     sleep 1
-    svc status nginx 2>/dev/null | grep -qi "running\|active" && \
-        _ok "Nginx SNI 分流已启动" || _warn "Nginx 启动异常"
+    if is_service_active nginx; then
+        _ok "Nginx SNI 分流已启动"
+    else
+        _warn "Nginx 启动异常"
+    fi
 
     # 13. 显示结果
+    local ipv6
+    ipv6=$(get_ipv6)
+
     echo ""
     _dline
     echo -e "  ${G}安装完成!${NC}"
@@ -1362,7 +1476,8 @@ do_install() {
     echo -e "  ${D}• 其他 SNI → 黑洞 (防 CF CDN 流量被盗刷)${NC}"
     echo ""
     echo -e "  ${W}连接信息:${NC}"
-    echo -e "  服务器: $ipv4"
+    echo -e "  IPv4:   ${ipv4:-${D}无${NC}}"
+    [[ -n "$ipv6" ]] && echo -e "  IPv6:   $ipv6"
     echo -e "  端口:   $port"
     echo -e "  SNI:    $sni"
     echo -e "  加密:   none"
@@ -1370,13 +1485,22 @@ do_install() {
     echo -e "  Flow:   xtls-rprx-vision"
     echo ""
     echo -e "  ${W}分享链接:${NC}"
-    local link
-    link="vless://${default_uuid}@${ipv4}:${port}?encryption=none&security=reality&type=tcp&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${first_short_id}&flow=xtls-rprx-vision#VLESS-Reality"
-    echo -e "  ${G}${link}${NC}"
+
+    local link4 link6
+    if [[ -n "$ipv4" ]]; then
+        link4=$(build_vless_link "$default_uuid" "$ipv4" "$port" "$sni" "$public_key" "$first_short_id" "VLESS-Reality")
+        echo -e "  ${G}IPv4: ${link4}${NC}"
+        show_qr "$link4"
+    fi
+    if [[ -n "$ipv6" ]]; then
+        link6=$(build_vless_link "$default_uuid" "$ipv6" "$port" "$sni" "$public_key" "$first_short_id" "VLESS-Reality")
+        echo -e "  ${G}IPv6: ${link6}${NC}"
+        show_qr "$link6"
+    fi
     echo ""
 
-    # 保存 join 链接
-    echo "$link" > "$CFG/join.txt"
+    # 保存 join 链接（优先 IPv4）
+    echo "${link4:-$link6}" > "$CFG/join.txt"
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -1393,14 +1517,14 @@ show_status() {
 
     # Xray 服务状态
     local xray_status="${R}未运行${NC}"
-    if svc status vless-reality 2>/dev/null | grep -qi "running\|active"; then
+    if is_service_active vless-reality; then
         xray_status="${G}运行中${NC}"
     fi
 
     # Nginx SNI 分流状态
     local nginx_status="${D}未安装${NC}"
     if check_cmd nginx; then
-        if svc status nginx 2>/dev/null | grep -qi "running\|active"; then
+        if is_service_active nginx; then
             nginx_status="${G}运行中${NC} ${D}(SNI分流)${NC}"
         else
             nginx_status="${R}未运行${NC}"
@@ -1425,7 +1549,7 @@ show_full_info() {
     echo -e "  ${W}详细配置信息${NC}"
     _line
 
-    local port sni short_id private_key public_key default_uuid ipv4
+    local port sni short_id private_key public_key default_uuid ipv4 ipv6
     port=$(db_get_field '.port' 2>/dev/null)
     sni=$(db_get_field '.sni' 2>/dev/null)
     short_id=$(db_get_field '.short_id' 2>/dev/null)
@@ -1433,9 +1557,11 @@ show_full_info() {
     public_key=$(cat "$CFG/public.key" 2>/dev/null || true)
     default_uuid=$(db_get_field '.default_uuid' 2>/dev/null)
     ipv4=$(get_ipv4)
+    ipv6=$(get_ipv6)
 
     echo -e "  ${W}服务器:${NC}"
-    echo -e "    IPv4:     $ipv4"
+    echo -e "    IPv4:     ${ipv4:-${D}无${NC}}"
+    echo -e "    IPv6:     ${ipv6:-${D}无${NC}}"
     echo -e "    端口:     $port"
     echo ""
     echo -e "  ${W}Reality 配置:${NC}"
@@ -1458,9 +1584,18 @@ show_full_info() {
     # 分享链接
     if [[ -n "$port" && -n "$sni" && -n "$public_key" && -n "$short_id" && -n "$default_uuid" ]]; then
         echo -e "  ${W}分享链接:${NC}"
-        local link
-        link="vless://${default_uuid}@${ipv4}:${port}?encryption=none&security=reality&type=tcp&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&flow=xtls-rprx-vision#VLESS-Reality"
-        echo -e "  ${G}${link}${NC}"
+        if [[ -n "$ipv4" ]]; then
+            local link4
+            link4=$(build_vless_link "$default_uuid" "$ipv4" "$port" "$sni" "$public_key" "$short_id" "VLESS-Reality")
+            echo -e "  ${G}IPv4: ${link4}${NC}"
+            show_qr "$link4"
+        fi
+        if [[ -n "$ipv6" ]]; then
+            local link6
+            link6=$(build_vless_link "$default_uuid" "$ipv6" "$port" "$sni" "$public_key" "$short_id" "VLESS-Reality")
+            echo -e "  ${G}IPv6: ${link6}${NC}"
+            show_qr "$link6"
+        fi
     fi
 }
 
