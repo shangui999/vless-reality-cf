@@ -76,37 +76,89 @@ _header() {
 #  网络工具
 #═══════════════════════════════════════════════════════════════════════════════
 
+# 判断是否为公网 IPv4（排除私网 / CGNAT / 环回 / 链路本地等）
+_is_public_ipv4() {
+    local ip="$1" o1 o2
+    [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+    o1=${ip%%.*}
+    o2=${ip#*.}; o2=${o2%%.*}
+    (( o1 <= 255 && o2 <= 255 )) || return 1
+    (( o1 == 10 )) && return 1                              # 10.0.0.0/8
+    (( o1 == 172 && o2 >= 16 && o2 <= 31 )) && return 1     # 172.16.0.0/12
+    (( o1 == 192 && o2 == 168 )) && return 1                # 192.168.0.0/16
+    (( o1 == 100 && o2 >= 64 && o2 <= 127 )) && return 1    # 100.64.0.0/10 CGNAT
+    (( o1 == 127 )) && return 1                             # 127.0.0.0/8 环回
+    (( o1 == 169 && o2 == 254 )) && return 1                # 169.254.0.0/16 链路本地
+    (( o1 == 0 || o1 == 255 )) && return 1
+    return 0
+}
+
+# 判断是否为公网 IPv6（排除环回 ::1 / 未指定 :: / 链路本地 fe80 / ULA fc00::/7）
+_is_public_ipv6() {
+    local ip="${1,,}"
+    [[ "$ip" == *:* ]] || return 1
+    case "$ip" in
+        ::1|::) return 1 ;;
+        fe8*:*|fe9*:*|fea*:*|feb*:*) return 1 ;;   # fe80::/10 链路本地
+        fc*:*|fd*:*) return 1 ;;                    # fc00::/7 ULA
+    esac
+    return 0
+}
+
+# 读取云平台 metadata，自动支持 IMDSv2 token（阿里云/AWS 加固模式）
+_imds_get() {
+    local url="$1" host val token ttl_hdr token_hdr
+    host=${url#*://}; host=${host%%/*}
+    case "$host" in
+        100.100.100.200) ttl_hdr="X-aliyun-ecs-metadata-token-ttl-seconds: 180"
+                         token_hdr="X-aliyun-ecs-metadata-token" ;;
+        169.254.169.254) ttl_hdr="X-aws-ec2-metadata-token-ttl-seconds: 180"
+                         token_hdr="X-aws-ec2-metadata-token" ;;
+        *)               ttl_hdr=""; token_hdr="" ;;
+    esac
+    # 先尝试免 token（IMDSv1 / 非加固实例）
+    val=$(curl -sf --connect-timeout 3 "$url" 2>/dev/null)
+    # 加固模式下需带 token 重试
+    if [[ -z "$val" && -n "$ttl_hdr" ]]; then
+        token=$(curl -sf -X PUT --connect-timeout 3 -H "$ttl_hdr" \
+                     "http://$host/latest/api/token" 2>/dev/null)
+        [[ -n "$token" ]] && \
+            val=$(curl -sf --connect-timeout 3 -H "$token_hdr: $token" "$url" 2>/dev/null)
+    fi
+    echo "$val"
+}
+
 get_ipv4() {
     [[ -n "$_CACHED_IPV4" ]] && { echo "$_CACHED_IPV4"; return; }
-    local result=""
+    local result="" cand svc meta_url
 
     # 1. 外部 IP 服务（多个源，提高成功率）
-    result=$(curl -4 -sf --connect-timeout 5 ip.sb 2>/dev/null || \
-             curl -4 -sf --connect-timeout 5 ifconfig.me 2>/dev/null || \
-             curl -4 -sf --connect-timeout 5 api.ipify.org 2>/dev/null || \
-             curl -4 -sf --connect-timeout 5 icanhazip.com 2>/dev/null || true)
+    for svc in ip.sb ifconfig.me api.ipify.org icanhazip.com; do
+        cand=$(curl -4 -sf --connect-timeout 5 "$svc" 2>/dev/null | tr -d '[:space:]')
+        if _is_public_ipv4 "$cand"; then result="$cand"; break; fi
+    done
 
-    # 2. 回退：云平台 metadata API（外部 IP 服务被墙时很有用）
+    # 2. 回退：云平台 metadata API（外部 IP 被墙时很有用，支持 IMDSv2 token）
     if [[ -z "$result" ]]; then
-        local meta_url
-        # 阿里云
         for meta_url in \
             "http://100.100.100.200/latest/meta-data/eipv4" \
             "http://100.100.100.200/latest/meta-data/public-ipv4" \
             "http://169.254.169.254/latest/meta-data/public-ipv4" \
             "http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address"; do
-            result=$(curl -4 -sf --connect-timeout 3 "$meta_url" 2>/dev/null)
-            [[ -n "$result" ]] && break
+            cand=$(_imds_get "$meta_url" | tr -d '[:space:]')
+            if _is_public_ipv4 "$cand"; then result="$cand"; break; fi
         done
     fi
 
-    # 3. 回退：从默认路由接口取本地公网/内网 IP
+    # 3. 回退：本机接口地址，仅当为公网地址时才采用（避免把内网 VPC IP 当公网）
     if [[ -z "$result" ]]; then
-        result=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") print $(i+1)}' | head -1)
+        for cand in $(hostname -I 2>/dev/null); do
+            if _is_public_ipv4 "$cand"; then result="$cand"; break; fi
+        done
     fi
-    # 4. 再回退：hostname -I 的第一个地址
     if [[ -z "$result" ]]; then
-        result=$(hostname -I 2>/dev/null | awk '{print $1}')
+        cand=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") print $(i+1)}' | head -1)
+        _is_public_ipv4 "$cand" && result="$cand"
     fi
 
     [[ -n "$result" ]] && _CACHED_IPV4="$result"
@@ -115,31 +167,30 @@ get_ipv4() {
 
 get_ipv6() {
     [[ -n "$_CACHED_IPV6" ]] && { echo "$_CACHED_IPV6"; return; }
-    local result=""
+    local result="" cand svc meta_url
 
     # 1. 外部 IP 服务
-    result=$(curl -6 -sf --connect-timeout 5 ip.sb 2>/dev/null || \
-             curl -6 -sf --connect-timeout 5 ifconfig.me 2>/dev/null || \
-             curl -6 -sf --connect-timeout 5 api.ipify.org 2>/dev/null || true)
+    for svc in ip.sb ifconfig.me api.ipify.org; do
+        cand=$(curl -6 -sf --connect-timeout 5 "$svc" 2>/dev/null | tr -d '[:space:]')
+        if _is_public_ipv6 "$cand"; then result="$cand"; break; fi
+    done
 
-    # 2. 回退：云平台 metadata API
+    # 2. 回退：云平台 metadata API（支持 IMDSv2 token）
     if [[ -z "$result" ]]; then
-        local meta_url
         for meta_url in \
             "http://100.100.100.200/latest/meta-data/ipv6" \
             "http://169.254.169.254/latest/meta-data/ipv6"; do
-            result=$(curl -6 -sf --connect-timeout 3 "$meta_url" 2>/dev/null)
-            [[ -n "$result" ]] && break
+            cand=$(_imds_get "$meta_url" | tr -d '[:space:]')
+            if _is_public_ipv6 "$cand"; then result="$cand"; break; fi
         done
     fi
 
-    # 3. 回退：从默认路由接口取 IPv6 全球单播地址（排除链路本地）
+    # 3. 回退：本机接口上的全球单播 IPv6（排除环回 ::1 / 链路本地 fe80 / ULA）
     if [[ -z "$result" ]]; then
-        result=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") print $(i+1)}' | head -1)
-    fi
-    # 4. 再回退：从本机接口取第一个非链路本地 IPv6
-    if [[ -z "$result" ]]; then
-        result=$(ip -6 addr show 2>/dev/null | awk '/inet6/{print $2}' | grep -v '^fe80' | head -1 | cut -d/ -f1)
+        while read -r cand; do
+            cand=${cand%%/*}
+            if _is_public_ipv6 "$cand"; then result="$cand"; break; fi
+        done < <(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2}')
     fi
 
     [[ -n "$result" ]] && _CACHED_IPV6="$result"
