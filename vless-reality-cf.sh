@@ -105,60 +105,41 @@ _is_public_ipv6() {
     return 0
 }
 
-# 读取云平台 metadata，自动支持 IMDSv2 token（阿里云/AWS 加固模式）
-_imds_get() {
-    local url="$1" host val token ttl_hdr token_hdr
-    host=${url#*://}; host=${host%%/*}
-    case "$host" in
-        100.100.100.200) ttl_hdr="X-aliyun-ecs-metadata-token-ttl-seconds: 180"
-                         token_hdr="X-aliyun-ecs-metadata-token" ;;
-        169.254.169.254) ttl_hdr="X-aws-ec2-metadata-token-ttl-seconds: 180"
-                         token_hdr="X-aws-ec2-metadata-token" ;;
-        *)               ttl_hdr=""; token_hdr="" ;;
-    esac
-    # 先尝试免 token（IMDSv1 / 非加固实例）
-    val=$(curl -sf --connect-timeout 3 "$url" 2>/dev/null)
-    # 加固模式下需带 token 重试
-    if [[ -z "$val" && -n "$ttl_hdr" ]]; then
-        token=$(curl -sf -X PUT --connect-timeout 3 -H "$ttl_hdr" \
-                     "http://$host/latest/api/token" 2>/dev/null)
-        [[ -n "$token" ]] && \
-            val=$(curl -sf --connect-timeout 3 -H "$token_hdr: $token" "$url" 2>/dev/null)
-    fi
-    echo "$val"
+# 读取 Cloudflare trace 里的出口 IP（全球 CDN，抗封锁）；$1 = 4 或 6
+_cf_trace_ip() {
+    curl -"$1" -sf --connect-timeout 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+        | awk -F= '/^ip=/{print $2}' | tr -d '[:space:]'
 }
 
 get_ipv4() {
     [[ -n "$_CACHED_IPV4" ]] && { echo "$_CACHED_IPV4"; return; }
-    local result="" cand svc meta_url
+    local result="" cand u
 
-    # 1. 外部 IP 服务（多个源，提高成功率）
-    for svc in ip.sb ifconfig.me api.ipify.org icanhazip.com; do
-        cand=$(curl -4 -sf --connect-timeout 5 "$svc" 2>/dev/null | tr -d '[:space:]')
+    # 1. 外部 HTTP 回显服务（多源，任一可用即可）
+    for u in ip.sb ifconfig.me api.ipify.org icanhazip.com ipinfo.io/ip checkip.amazonaws.com ident.me; do
+        cand=$(curl -4 -sf --connect-timeout 5 "$u" 2>/dev/null | tr -d '[:space:]')
         if _is_public_ipv4 "$cand"; then result="$cand"; break; fi
     done
 
-    # 2. 回退：云平台 metadata API（外部 IP 被墙时很有用，支持 IMDSv2 token）
+    # 2. Cloudflare trace（全球 CDN，与上面失效场景不同）
     if [[ -z "$result" ]]; then
-        for meta_url in \
-            "http://100.100.100.200/latest/meta-data/eipv4" \
-            "http://100.100.100.200/latest/meta-data/public-ipv4" \
-            "http://169.254.169.254/latest/meta-data/public-ipv4" \
-            "http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address"; do
-            cand=$(_imds_get "$meta_url" | tr -d '[:space:]')
-            if _is_public_ipv4 "$cand"; then result="$cand"; break; fi
-        done
+        cand=$(_cf_trace_ip 4)
+        _is_public_ipv4 "$cand" && result="$cand"
     fi
 
-    # 3. 回退：本机接口地址，仅当为公网地址时才采用（避免把内网 VPC IP 当公网）
+    # 3. DNS 方式（不走 HTTP，更难被墙）
+    if [[ -z "$result" ]] && check_cmd dig; then
+        cand=$(dig -4 +short +time=3 +tries=1 myip.opendns.com @resolver1.opendns.com 2>/dev/null | tr -d '[:space:]')
+        _is_public_ipv4 "$cand" || \
+            cand=$(dig -4 +short +time=3 +tries=1 txt o-o.myaddr.l.google.com @ns1.google.com 2>/dev/null | tr -d '"[:space:]')
+        _is_public_ipv4 "$cand" && result="$cand"
+    fi
+
+    # 4. 本机接口地址，仅当为公网地址时才采用（NAT 直挂公网场景）
     if [[ -z "$result" ]]; then
         for cand in $(hostname -I 2>/dev/null); do
             if _is_public_ipv4 "$cand"; then result="$cand"; break; fi
         done
-    fi
-    if [[ -z "$result" ]]; then
-        cand=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") print $(i+1)}' | head -1)
-        _is_public_ipv4 "$cand" && result="$cand"
     fi
 
     [[ -n "$result" ]] && _CACHED_IPV4="$result"
@@ -167,25 +148,21 @@ get_ipv4() {
 
 get_ipv6() {
     [[ -n "$_CACHED_IPV6" ]] && { echo "$_CACHED_IPV6"; return; }
-    local result="" cand svc meta_url
+    local result="" cand u
 
-    # 1. 外部 IP 服务
-    for svc in ip.sb ifconfig.me api.ipify.org; do
-        cand=$(curl -6 -sf --connect-timeout 5 "$svc" 2>/dev/null | tr -d '[:space:]')
+    # 1. 外部 HTTP 回显服务
+    for u in ip.sb ifconfig.me api6.ipify.org icanhazip.com ident.me; do
+        cand=$(curl -6 -sf --connect-timeout 5 "$u" 2>/dev/null | tr -d '[:space:]')
         if _is_public_ipv6 "$cand"; then result="$cand"; break; fi
     done
 
-    # 2. 回退：云平台 metadata API（支持 IMDSv2 token）
+    # 2. Cloudflare trace
     if [[ -z "$result" ]]; then
-        for meta_url in \
-            "http://100.100.100.200/latest/meta-data/ipv6" \
-            "http://169.254.169.254/latest/meta-data/ipv6"; do
-            cand=$(_imds_get "$meta_url" | tr -d '[:space:]')
-            if _is_public_ipv6 "$cand"; then result="$cand"; break; fi
-        done
+        cand=$(_cf_trace_ip 6)
+        _is_public_ipv6 "$cand" && result="$cand"
     fi
 
-    # 3. 回退：本机接口上的全球单播 IPv6（排除环回 ::1 / 链路本地 fe80 / ULA）
+    # 3. 本机接口上的全球单播 IPv6（排除环回 ::1 / 链路本地 fe80 / ULA）
     if [[ -z "$result" ]]; then
         while read -r cand; do
             cand=${cand%%/*}
