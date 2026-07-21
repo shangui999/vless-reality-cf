@@ -115,16 +115,16 @@ get_ipv4() {
     [[ -n "$_CACHED_IPV4" ]] && { echo "$_CACHED_IPV4"; return; }
     local result="" cand u
 
-    # 1. 外部 HTTP 回显服务（多源，任一可用即可）
-    for u in ip.sb ifconfig.me api.ipify.org icanhazip.com ipinfo.io/ip checkip.amazonaws.com ident.me; do
-        cand=$(curl -4 -sf --connect-timeout 5 "$u" 2>/dev/null | tr -d '[:space:]')
-        if _is_public_ipv4 "$cand"; then result="$cand"; break; fi
-    done
+    # 1. Cloudflare trace（首选，全球 CDN，最稳）
+    cand=$(_cf_trace_ip 4)
+    _is_public_ipv4 "$cand" && result="$cand"
 
-    # 2. Cloudflare trace（全球 CDN，与上面失效场景不同）
+    # 2. 外部 HTTP 回显服务（多源，任一可用即可）
     if [[ -z "$result" ]]; then
-        cand=$(_cf_trace_ip 4)
-        _is_public_ipv4 "$cand" && result="$cand"
+        for u in ip.sb ifconfig.me api.ipify.org icanhazip.com ipinfo.io/ip checkip.amazonaws.com ident.me; do
+            cand=$(curl -4 -sf --connect-timeout 5 "$u" 2>/dev/null | tr -d '[:space:]')
+            if _is_public_ipv4 "$cand"; then result="$cand"; break; fi
+        done
     fi
 
     # 3. DNS 方式（不走 HTTP，更难被墙）
@@ -150,16 +150,16 @@ get_ipv6() {
     [[ -n "$_CACHED_IPV6" ]] && { echo "$_CACHED_IPV6"; return; }
     local result="" cand u
 
-    # 1. 外部 HTTP 回显服务
-    for u in ip.sb ifconfig.me api6.ipify.org icanhazip.com ident.me; do
-        cand=$(curl -6 -sf --connect-timeout 5 "$u" 2>/dev/null | tr -d '[:space:]')
-        if _is_public_ipv6 "$cand"; then result="$cand"; break; fi
-    done
+    # 1. Cloudflare trace（首选，全球 CDN，最稳）
+    cand=$(_cf_trace_ip 6)
+    _is_public_ipv6 "$cand" && result="$cand"
 
-    # 2. Cloudflare trace
+    # 2. 外部 HTTP 回显服务
     if [[ -z "$result" ]]; then
-        cand=$(_cf_trace_ip 6)
-        _is_public_ipv6 "$cand" && result="$cand"
+        for u in ip.sb ifconfig.me api6.ipify.org icanhazip.com ident.me; do
+            cand=$(curl -6 -sf --connect-timeout 5 "$u" 2>/dev/null | tr -d '[:space:]')
+            if _is_public_ipv6 "$cand"; then result="$cand"; break; fi
+        done
     fi
 
     # 3. 本机接口上的全球单播 IPv6（排除环回 ::1 / 链路本地 fe80 / ULA）
