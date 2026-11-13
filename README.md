@@ -23,15 +23,16 @@
 | 发行版 | 包管理 | 服务管理 | 说明 |
 |--------|--------|----------|------|
 | Debian / Ubuntu | apt | systemd | 最常用 |
-| CentOS / RHEL / Alma / Rocky / Fedora | dnf / yum | systemd | 自动装 `nginx-mod-stream`，自动放行 firewalld 端口、标记 SELinux `http_port_t` |
-| Alpine | apk | openrc | 自动装 `bash` / `gcompat` / `nginx-mod-stream` / `nginx-openrc` |
+| CentOS / RHEL / Alma / Rocky / Fedora | dnf / yum | systemd | 检查 stream 模块与防火墙；SELinux 策略变更需确认 |
+| Alpine | apk | OpenRC | 自动装 `bash` / `nginx-mod-stream` / `nginx-openrc` |
 
-Alpine 上 Xray 用的是官方 glibc 二进制，靠 `gcompat` 兼容层运行（官方没有 musl 构建）。
-CentOS 7 需要 EPEL 才有 nginx，脚本会自动尝试；Alma/Rocky 9 直接从 AppStream 取。
+Xray 使用指定版本的官方 Linux 构建，替换前检查可执行性、版本和现有配置，不预设需要 `gcompat`。
+CentOS 7 已停止维护，依赖软件源及 EPEL 的实际可用性；脚本不会绕过失效的软件源。CentOS 系列尚未完成实机验收。
+SELinux Enforcing 时需要 `semanage`（现代系统安装 `policycoreutils-python-utils`，CentOS 7 为 `policycoreutils-python`）；监听与后端端口需要 `http_port_t`，Nginx 转发需要 `httpd_can_network_relay`。脚本会说明该布尔值影响所有 `httpd_t` 服务并请求确认，不关闭 SELinux、不覆盖其他服务的端口类型。
 
 ## NAT / 双栈说明
 
-- 如果公网 IPv4 要靠 NAT 映射（本机网卡是 100.64/10 或内网地址），脚本会提示并**优先输出 IPv6 直连链接**，IPv4 链接需要你自己在 NAT 和安全组上做端口转发。
+- 脚本比较 IPv4 默认出站路由的源地址与公网探测地址；不再因为回环、Docker 等私网网卡而误判 NAT。发现地址不一致时优先把 IPv6 链接写入 `join.txt`，IPv4 入站仍需自行配置 NAT 端口转发和安全组；若外部映射端口不同，需修改客户端链接端口。
 - IPv6 为直连时会自动生成 `vless://...@[IPv6]:端口` 形式的链接。
 
 ## 安装
@@ -41,6 +42,19 @@ SSH 登录你的 VPS，复制这一行：
 ```bash
 wget -O vless-reality-cf.sh https://raw.githubusercontent.com/shangui999/vless-reality-cf/master/vless-reality-cf.sh && chmod +x vless-reality-cf.sh && sudo ./vless-reality-cf.sh
 ```
+
+默认节点名为 `VLESS-<连接IP>`：IPv4 使用完整公网地址，IPv6 使用完整 IPv6 地址。首次安装输出、二维码、保存的链接与后续 `--links` 保持一致；仅改变默认账号的客户端显示名称，不修改账号名、UUID 或 Reality 协议，手动添加的账号保留原有名称。
+
+默认固定 Xray **26.11.9**，可显式指定其他发布版本（需存在对应架构的官方资源）：
+
+```bash
+sudo ./vless-reality-cf.sh --install --xray-version 26.11.9
+sudo ./vless-reality-cf.sh --xray-version=v26.11.9 --install
+```
+
+重装保留已有用户（包括禁用状态）、密钥、端口和 SNI，并重启服务使指定版本生效。二进制替换前先验证，旧版保存在 `/usr/local/bin/xray.previous`；启动失败会返回错误，不代表已自动回滚。现有 Nginx 站点不会被自动删除，端口冲突需先自行处理。
+
+删除或禁用全部账号后不会恢复默认账号；凭据变更应用失败时会尝试停止 Xray，防止旧凭据继续提供访问。以 `--links` 输出的当前启用用户链接为准，安装时的 `join.txt` 只是初次分享快照。
 
 然后跟着菜单走：
 
@@ -58,7 +72,7 @@ wget -O vless-reality-cf.sh https://raw.githubusercontent.com/shangui999/vless-r
   请选择 [默认 1]:
 ```
 
-**一路回车就装完了。** 最后会给你一个 vless:// 开头的链接。
+按提示选择配置；SELinux 策略变更需要显式确认。只有配置校验及两个服务启动成功后才会显示安装完成和 `vless://` 链接。修改端口/SNI 失败时会恢复原配置，并在已经操作服务的情况下尝试恢复原服务状态。
 
 ## 手机端怎么用？
 

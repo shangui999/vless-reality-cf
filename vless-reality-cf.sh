@@ -11,7 +11,7 @@
 
 # Alpine 只有 BusyBox ash 且默认不装 bash。用 /bin/sh 起头自举 bash 再重新执行自身，
 # 避免 "bad interpreter: /bin/bash" 直接失败。这一段必须是 POSIX sh 语法。
-if [ -z "${BASH_VERSION:-}" ]; then
+if [ -z "${BASH_VERSION:-}" ] || shopt -oq posix 2>/dev/null; then
     if ! command -v bash >/dev/null 2>&1; then
         if command -v apk >/dev/null 2>&1; then
             apk add --no-cache bash >/dev/null 2>&1
@@ -214,15 +214,11 @@ get_ipv6() {
     echo "$result"
 }
 
-# 本机网卡上只有私网/CGNAT 地址 → 公网 IPv4 靠 NAT 映射，入站必须做端口转发
 ipv4_is_nat() {
-    local cidr
-    for cidr in $(ip addr show 2>/dev/null | awk '$1=="inet"{print $2}'); do
-        if ! _is_public_ipv4 "${cidr%%/*}"; then
-            return 0
-        fi
-    done
-    return 1
+    local public_ip="$1" source_ip
+    _is_public_ipv4 "$public_ip" || return 1
+    source_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="src") {print $(i+1); exit}}')
+    [[ -n "$source_ip" && "$source_ip" != "$public_ip" ]]
 }
 
 urlencode() {
@@ -286,9 +282,9 @@ EOF
 _db_apply() {
     [[ -f "$DB_FILE" ]] || init_db || return 1
     local tmp
-    tmp=$(mktemp) || return 1
-    if jq "$@" "$DB_FILE" > "$tmp" 2>/dev/null; then
-        mv "$tmp" "$DB_FILE"
+    tmp=$(mktemp "$CFG/.db.XXXXXX") || return 1
+    if jq "$@" "$DB_FILE" > "$tmp"; then
+        mv "$tmp" "$DB_FILE" || { rm -f "$tmp"; return 1; }
         return 0
     fi
     rm -f "$tmp"
@@ -373,7 +369,7 @@ create_xray_service() {
     if [[ "$SVC_MGR" == "openrc" ]]; then
         # 有 supervise-daemon 就托管进程（崩溃自动拉起），否则退化为后台运行
         if command -v supervise-daemon >/dev/null 2>&1; then
-            cat > /etc/init.d/vless-reality <<'EOF'
+            cat > /etc/init.d/vless-reality <<'EOF' || return 1
 #!/sbin/openrc-run
 name="vless-reality"
 description="VLESS Reality CF Proxy"
@@ -393,7 +389,7 @@ depend() {
 }
 EOF
         else
-            cat > /etc/init.d/vless-reality <<'EOF'
+            cat > /etc/init.d/vless-reality <<'EOF' || return 1
 #!/sbin/openrc-run
 name="vless-reality"
 description="VLESS Reality CF Proxy"
@@ -411,10 +407,10 @@ depend() {
 }
 EOF
         fi
-        chmod +x /etc/init.d/vless-reality
-        rc-update add vless-reality default 2>/dev/null
-    else
-        cat > /etc/systemd/system/vless-reality.service <<'EOF'
+        chmod +x /etc/init.d/vless-reality || return 1
+        rc-update add vless-reality default || return 1
+    elif [[ "$SVC_MGR" == "systemd" ]]; then
+        cat > /etc/systemd/system/vless-reality.service <<'EOF' || return 1
 [Unit]
 Description=VLESS Reality CF Proxy
 After=network.target
@@ -430,24 +426,39 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload 2>/dev/null
-        systemctl enable vless-reality 2>/dev/null
+        systemctl daemon-reload || return 1
+        systemctl enable vless-reality || return 1
+    else
+        _err "不支持的服务管理器: $SVC_MGR"
+        return 1
     fi
     _ok "服务已创建"
 }
 
 restart_xray() {
-    svc_up vless-reality
+    "$XRAY_BIN" run -test -c "$XRAY_CONFIG" || return 1
+    svc_up vless-reality || { _err "Xray 启动或重启失败"; return 1; }
     sleep 1
-    if is_service_active vless-reality; then
-        _ok "Xray 已重启"
-    else
-        _warn "Xray 重启后状态异常，请检查日志"
+    is_service_active vless-reality || { _err "Xray 重启后状态异常"; return 1; }
+    _ok "Xray 已重启"
+}
+
+apply_xray_changes() {
+    if generate_xray_config && restart_xray; then
+        return 0
     fi
-    # 同时重启 Nginx (SNI 分流)
-    if check_cmd nginx; then
-        restart_nginx
-    fi
+    # 撤销凭据失败时不能继续用旧配置提供访问。
+    svc stop vless-reality || _err "停止 Xray 失败，请立即人工撤销访问"
+    _err "配置未生效，已请求停止 Xray，请检查日志后重试"
+    return 1
+}
+
+start_proxy_services() {
+    nginx -t || return 1
+    create_nginx_service || return 1
+    create_xray_service || return 1
+    restart_xray || { svc stop vless-reality; return 1; }
+    restart_nginx || return 1
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -456,24 +467,22 @@ restart_xray() {
 
 install_deps() {
     _info "安装基础依赖 (包管理器: $PKG_MGR)..."
-    pkg_refresh
+    pkg_refresh || return 1
 
     local base="curl jq ca-certificates unzip"
     case "$PKG_MGR" in
         apk)
-            # gcompat: Xray 官方二进制是 glibc 构建，Alpine(musl) 需要兼容层
-            # iproute2: 提供 ip / ss；coreutils: 提供完整 install/stat
-            pkg_install $base openssl coreutils iproute2 gcompat
+            pkg_install $base openssl coreutils iproute2 || return 1
             pkg_install_optional libqrencode-tools
             ;;
         dnf|yum)
             # CentOS 7 的 jq / qrencode / nginx 都在 EPEL
             pkg_install_optional epel-release
-            pkg_install $base openssl coreutils iproute
+            pkg_install $base openssl coreutils iproute || return 1
             pkg_install_optional qrencode
             ;;
         apt)
-            pkg_install $base openssl coreutils iproute2
+            pkg_install $base openssl coreutils iproute2 || return 1
             pkg_install_optional qrencode
             ;;
         *)
@@ -482,7 +491,7 @@ install_deps() {
     esac
 
     local missing="" c
-    for c in curl jq unzip; do
+    for c in curl jq unzip openssl ip ss install timeout; do
         check_cmd "$c" || missing="$missing $c"
     done
     if [[ -n "$missing" ]]; then
@@ -526,6 +535,9 @@ nginx_has_stream() {
 }
 
 install_nginx() {
+    if [[ "$SVC_MGR" == openrc && ! -x /etc/init.d/nginx ]]; then
+        pkg_install nginx-openrc || return 1
+    fi
     if check_cmd nginx && nginx_has_stream; then
         _ok "Nginx 已安装 (含 stream 模块)"
         return 0
@@ -534,12 +546,10 @@ install_nginx() {
     _info "安装 Nginx (含 stream 模块用于 SNI 分流)..."
     case "$PKG_MGR" in
         apk)
-            pkg_install nginx nginx-mod-stream
-            # Alpine 把 init 脚本单独打包，缺了它 nginx 没有 /etc/init.d/nginx
-            pkg_install_optional nginx-openrc
+            pkg_install nginx nginx-mod-stream || return 1
             ;;
         dnf|yum)
-            pkg_install nginx
+            pkg_install nginx || return 1
             # RHEL8+/CentOS8+ AppStream 提供 nginx-mod-stream；CentOS7(EPEL) 为静态编译
             pkg_install_optional nginx-mod-stream
             ;;
@@ -561,14 +571,22 @@ install_nginx() {
     return 1
 }
 
-generate_nginx_sni_config() {
-    local sni port
+generate_nginx_sni_config() (
+    local sni port backup existed=false success=false
     sni=$(db_get_field '.sni')
     port=$(db_get_field '.port')
-    [[ -z "$sni" ]] && { _err "未设置 SNI"; return 1; }
-    [[ -z "$port" ]] && port=443
-
-    mkdir -p "$(dirname "$NGINX_SNI_CONF")"
+    [[ "$sni" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*\.)+[a-zA-Z]{2,}$ ]] || { _err "SNI 格式无效"; return 1; }
+    valid_port "$port" || { _err "监听端口无效"; return 1; }
+    ensure_stream_module_loaded || return 1
+    mkdir -p "$(dirname "$NGINX_SNI_CONF")" || return 1
+    backup=$(mktemp "${NGINX_SNI_CONF}.XXXXXX") || return 1
+    if [[ -f "$NGINX_SNI_CONF" ]]; then
+        cp -p "$NGINX_SNI_CONF" "$backup" || { rm -f "$backup"; return 1; }
+        existed=true
+    fi
+    trap 'if [[ "$success" != true ]]; then
+        if [[ "$existed" == true ]]; then cat "$backup" > "$NGINX_SNI_CONF"; else rm -f "$NGINX_SNI_CONF"; fi
+    fi; rm -f "$backup"' EXIT
 
     cat > "$NGINX_SNI_CONF" <<EOF
 # VLESS Reality SNI 分流 - 防 CF CDN 流量被盗刷
@@ -606,122 +624,142 @@ server {
 }
 EOF
 
+    [[ $? -eq 0 ]] || return 1
+    ensure_nginx_stream_include || return 1
+    success=true
     _ok "Nginx SNI 分流配置已生成: $NGINX_SNI_CONF"
+)
 
-    ensure_stream_module_loaded
-    ensure_nginx_stream_include
+ensure_stream_module_loaded() {
+    local dump build stream_module backup
+    build=$(nginx -V 2>&1) || return 1
+    [[ "$build" == *--with-stream=dynamic* ]] || return 0
+    dump=$(nginx -T) || { _err "现有 Nginx 配置无效，请先修复"; return 1; }
+    if printf '%s\n' "$dump" | grep -Eq '^[[:space:]]*load_module[[:space:]]+[^;#]*ngx_stream_module\.so'; then
+        return 0
+    fi
+    stream_module=$(find_nginx_stream_module) || { _err "未找到 stream 模块"; return 1; }
+    backup=$(mktemp /etc/nginx/.module-backup.XXXXXX) || return 1
+    cp -p /etc/nginx/nginx.conf "$backup" || { rm -f "$backup"; return 1; }
+    if ! { printf 'load_module "%s";\n' "$stream_module"; cat "$backup"; } > /etc/nginx/nginx.conf || ! nginx -t; then
+        cat "$backup" > /etc/nginx/nginx.conf
+        rm -f "$backup"
+        return 1
+    fi
+    rm -f "$backup"
 }
 
-# 动态编译的 stream 模块需要 load_module；三家发行版的自动加载机制各不相同
-ensure_stream_module_loaded() {
-    local stream_module
-    stream_module=$(find_nginx_stream_module 2>/dev/null)
-    [[ -z "$stream_module" ]] && return 0
-
-    # nginx.conf 里已有 load_module 就直接用
-    if grep -q "ngx_stream_module" /etc/nginx/nginx.conf 2>/dev/null; then
+ensure_nginx_stream_include() {
+    local dump f target="" lineno="" backup
+    dump=$(nginx -T) || return 1
+    if printf '%s\n' "$dump" | grep -Fxq "# configuration file $NGINX_SNI_CONF:"; then
         return 0
     fi
 
-    # 发行版通过 modules 目录自动加载（Debian/Alpine/RHEL 路径各不相同）
-    local d
-    for d in /etc/nginx/modules-enabled /etc/nginx/modules /etc/nginx/modules.conf.d /usr/share/nginx/modules; do
-        [[ -d "$d" ]] || continue
-        if grep -qE "include[[:space:]]+${d}/\*\.conf" /etc/nginx/nginx.conf 2>/dev/null && \
-           grep -ql "ngx_stream_module" "$d"/*.conf 2>/dev/null; then
-            return 0
-        fi
-    done
+    # nginx -T 只列出实际加载的文件，不能扫描未被 include 的配置目录。
+    while IFS= read -r f; do
+        lineno=$(awk '
+            {line=$0; sub(/#.*/, "", line)}
+            line ~ /^[[:space:]]*stream[[:space:]]*\{/ {print NR; exit}
+            line ~ /^[[:space:]]*stream[[:space:]]*$/ {pending=1; next}
+            pending && line ~ /^[[:space:]]*\{/ {print NR; exit}
+            line !~ /^[[:space:]]*$/ {pending=0}
+        ' "$f") || return 1
+        if [[ -n "$lineno" ]]; then target="$f"; break; fi
+    done < <(printf '%s\n' "$dump" | sed -n 's/^# configuration file \(.*\):$/\1/p')
 
-    # busybox sed 不支持 GNU 的 "1i\" 写法，用临时文件拼接
-    local tmp_conf
-    tmp_conf=$(mktemp) || return 1
-    { echo "load_module ${stream_module};"; cat /etc/nginx/nginx.conf; } > "$tmp_conf"
-    mv "$tmp_conf" /etc/nginx/nginx.conf
-    _ok "已添加 load_module ngx_stream_module"
-}
-
-# 让 nginx 加载 /etc/nginx/stream.conf.d/*.conf
-# Alpine 的 nginx-mod-stream 自带 /etc/nginx/conf.d/stream.conf（已有 stream{} 块），
-# 这时不能再追加一个 stream 块，否则 nginx 报 "stream directive is duplicate"
-ensure_nginx_stream_include() {
-    local f lineno
-    for f in /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf; do
-        [[ -f "$f" ]] || continue
-        if grep -q "stream.conf.d" "$f" 2>/dev/null; then
-            return 0
-        fi
-        lineno=$(grep -nE '^[[:space:]]*stream[[:space:]]*\{' "$f" 2>/dev/null | head -1 | cut -d: -f1)
-        if [[ -n "$lineno" ]]; then
-            local tmp_conf
-            tmp_conf=$(mktemp) || return 1
-            awk -v n="$lineno" 'NR==n{print; print "    include /etc/nginx/stream.conf.d/*.conf;"; next}{print}' \
-                "$f" > "$tmp_conf" && mv "$tmp_conf" "$f"
-            _ok "已在现有 stream 块 (${f#/etc/nginx/}) 中注入 include"
-            return 0
-        fi
-    done
-
-    cat >> /etc/nginx/nginx.conf <<'STREAMEOF'
-
-# SNI stream 分流 (VLESS Reality)
-stream {
-    include /etc/nginx/stream.conf.d/*.conf;
-}
-STREAMEOF
-    _ok "已在 nginx.conf 末尾添加 stream block"
+    [[ -n "$target" ]] || target=/etc/nginx/nginx.conf
+    backup=$(mktemp /etc/nginx/.stream-backup.XXXXXX) || return 1
+    cp -p "$target" "$backup" || { rm -f "$backup"; return 1; }
+    if [[ -n "$lineno" ]]; then
+        awk -v n="$lineno" 'NR==n {sub(/\{/, "{\n    include /etc/nginx/stream.conf.d/*.conf;\n")} {print}' \
+            "$backup" > "$target" || { cat "$backup" > "$target"; rm -f "$backup"; return 1; }
+    else
+        printf '\nstream {\n    include /etc/nginx/stream.conf.d/*.conf;\n}\n' >> "$target" || {
+            cat "$backup" > "$target"; rm -f "$backup"; return 1;
+        }
+    fi
+    if ! dump=$(nginx -T) || ! printf '%s\n' "$dump" | grep -Fxq "# configuration file $NGINX_SNI_CONF:"; then
+        cat "$backup" > "$target"
+        rm -f "$backup"
+        _err "Nginx 未正确加载 SNI 配置，已恢复修改的文件"
+        return 1
+    fi
+    rm -f "$backup"
+    _ok "Nginx 已加载 SNI 配置"
 }
 
 create_nginx_service() {
     case "$SVC_MGR" in
         openrc)  rc-update add nginx default 2>/dev/null ;;
-        systemd) systemctl enable nginx 2>/dev/null ;;
+        systemd) systemctl enable nginx ;;
+        *) _err "不支持的服务管理器: $SVC_MGR"; return 1 ;;
     esac
 }
 
 restart_nginx() {
-    # 先测试配置
-    if nginx -t 2>&1 | grep -q "successful"; then
-        svc_up nginx
-        sleep 1
-        if is_service_active nginx; then
-            _ok "Nginx 已重启 (SNI 分流生效)"
-        else
-            _warn "Nginx 重启后状态异常"
+    nginx -t || { _err "Nginx 配置校验失败，未重启服务"; return 1; }
+    svc_up nginx || { _err "Nginx 启动或重启失败"; return 1; }
+    sleep 1
+    is_service_active nginx || { _err "Nginx 重启后状态异常"; return 1; }
+    _ok "Nginx 已重启 (SNI 分流生效)"
+}
+
+valid_port() {
+    [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 && 10#$1 != XRAY_INTERNAL_PORT ))
+}
+
+configure_selinux_proxy() {
+    check_cmd getenforce || return 0
+    [[ "$(getenforce)" == "Enforcing" ]] || return 0
+    local port="$1" ports relay confirm p
+    local missing_ports=()
+    if ! check_cmd semanage || ! check_cmd getsebool || ! check_cmd setsebool; then
+        _err "SELinux Enforcing 需要 semanage/getsebool/setsebool；请安装 policycoreutils-python-utils（CentOS 7 为 policycoreutils-python）"
+        return 1
+    fi
+    ports=$(semanage port -l) || return 1
+    relay=$(getsebool httpd_can_network_relay) || return 1
+    for p in "$port" "$XRAY_INTERNAL_PORT"; do
+        if ! printf '%s\n' "$ports" | awk -v p="$p" '
+            $1=="http_port_t" && $2=="tcp" {
+                gsub(/,/, " ")
+                for (i=3;i<=NF;i++) {
+                    split($i,r,"-")
+                    if (p==r[1] || (r[2]!="" && p>=r[1] && p<=r[2])) found=1
+                }
+            }
+            END {exit !found}
+        '; then
+            missing_ports+=("$p")
         fi
-    else
-        _err "Nginx 配置测试失败:"
-        nginx -t 2>&1 | tail -5
+    done
+    if [[ ${#missing_ports[@]} -eq 0 && "$relay" == *"--> on" ]]; then return 0; fi
+
+    _warn "需标记监听/后端端口为 http_port_t 并启用 httpd_can_network_relay；该布尔值影响所有 httpd_t 服务"
+    read -rp "  是否允许上述 SELinux 策略变更？[y/N]: " confirm || return 1
+    [[ "$confirm" == [yY] ]] || { _err "未授权 SELinux 策略变更，停止安装"; return 1; }
+    for p in "${missing_ports[@]}"; do
+        semanage port -a -t http_port_t -p tcp "$p" || {
+            _err "SELinux 端口 $p 设置失败；不会覆盖其他服务已有的端口类型"
+            return 1
+        }
+    done
+    if [[ "$relay" != *"--> on" ]]; then
+        setsebool -P httpd_can_network_relay on || return 1
     fi
 }
 
-# 放行端口：firewalld / ufw / SELinux（CentOS 系常见拦路虎），全部尽力而为
 open_firewall_port() {
     local port="$1"
-    [[ -z "$port" ]] && return 0
-
-    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        if ! firewall-cmd --query-port="${port}/tcp" >/dev/null 2>&1; then
-            firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 && \
-            firewall-cmd --reload >/dev/null 2>&1 && _ok "firewalld 已放行 ${port}/tcp"
-        fi
+    valid_port "$port" || { _err "无效端口（不能使用内部端口 $XRAY_INTERNAL_PORT）"; return 1; }
+    configure_selinux_proxy "$port" || return 1
+    if check_cmd firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --add-port="${port}/tcp" && \
+            firewall-cmd --permanent --add-port="${port}/tcp" || return 1
     fi
-
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "${port}/tcp" >/dev/null 2>&1 && _ok "ufw 已放行 ${port}/tcp"
-    fi
-
-    # SELinux 为 Enforcing 时，nginx 只能 bind 已标记为 http_port_t 的端口
-    if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
-        if command -v semanage >/dev/null 2>&1; then
-            if ! semanage port -l 2>/dev/null | grep -qE "^http_port_t\b.*[[:space:]]${port}(,|$)"; then
-                semanage port -a -t http_port_t -p tcp "$port" >/dev/null 2>&1 && \
-                    _ok "SELinux 已标记 ${port}/tcp 为 http_port_t"
-            fi
-        else
-            _warn "SELinux Enforcing 但缺少 semanage，非 443 端口可能 bind 失败"
-            _warn "可安装 policycoreutils-python-utils 后重试"
-        fi
+    if check_cmd ufw && LC_ALL=C ufw status | grep -q "Status: active"; then
+        ufw allow "${port}/tcp" || return 1
     fi
     return 0
 }
@@ -730,72 +768,63 @@ open_firewall_port() {
 #  Xray 核心安装
 #═══════════════════════════════════════════════════════════════════════════════
 
-install_xray() {
-    local version="$XRAY_VERSION" ver
-    if [[ -x "$XRAY_BIN" ]]; then
-        ver=$("$XRAY_BIN" version 2>/dev/null | head -n1 | awk '{print $2}')
+install_xray() (
+    local version="$XRAY_VERSION" output ver arch xarch tmp data
+    if [[ -x "$XRAY_BIN" ]] && output=$("$XRAY_BIN" version); then
+        ver=$(printf '%s\n' "$output" | awk 'NR==1 {print $2}')
         if [[ "${ver#v}" == "$version" ]]; then
             _ok "Xray 已安装: v${version}"
             return 0
         fi
-        _info "Xray 当前版本: ${ver:-未知版本}，将安装指定版本 v${version}"
     fi
 
-    _info "安装 Xray-core v${version}..."
-
-    # XTLS 官方只发布 glibc 构建，Alpine(musl) 必须靠 gcompat 兼容层才能运行
-    if [[ "$PKG_MGR" == "apk" ]]; then
-        pkg_install gcompat || true
-    fi
-
-    # 架构检测
-    local arch
     arch=$(uname -m)
-    local xarch
     case "$arch" in
-        x86_64|amd64)  xarch="64" ;;
+        x86_64|amd64) xarch="64" ;;
         aarch64|arm64) xarch="arm64-v8a" ;;
-        armv7l|armv6l) xarch="arm32-v7a" ;;
+        armv7l) xarch="arm32-v7a" ;;
+        armv6l) xarch="arm32-v6" ;;
         *) _err "不支持的架构: $arch"; return 1 ;;
     esac
 
+    mkdir -p "$(dirname "$XRAY_BIN")" || return 1
+    tmp=$(mktemp -d "$(dirname "$XRAY_BIN")/.xray.XXXXXX") || return 1
+    trap 'rm -rf "$tmp"' EXIT
     local url="https://github.com/XTLS/Xray-core/releases/download/v${version}/Xray-linux-${xarch}.zip"
-    local tmp
-    tmp=$(mktemp -d)
+    _info "下载 Xray v${version}"
+    curl -fsSL --connect-timeout "$CURL_TIMEOUT" --max-time "$CURL_TIMEOUT_DOWNLOAD" \
+        -o "$tmp/xray.zip" "$url" || { _err "Xray 下载失败"; return 1; }
+    unzip -oq "$tmp/xray.zip" -d "$tmp" || return 1
+    chmod 755 "$tmp/xray" || return 1
+    output=$("$tmp/xray" version) || { _err "下载的 Xray 无法运行，旧版本未修改"; return 1; }
+    ver=$(printf '%s\n' "$output" | awk 'NR==1 {print $2}')
+    [[ "${ver#v}" == "$version" ]] || { _err "下载版本与指定版本不一致"; return 1; }
 
-    _info "下载: $url"
-    if ! curl -fsSL --connect-timeout "$CURL_TIMEOUT_DOWNLOAD" -o "$tmp/xray.zip" "$url"; then
-        rm -rf "$tmp"
-        _err "下载失败"
-        return 1
-    fi
-
-    unzip -oq "$tmp/xray.zip" -d "$tmp/" || { rm -rf "$tmp"; _err "解压失败"; return 1; }
-
-    install -m 755 "$tmp/xray" "$XRAY_BIN" || {
-        rm -rf "$tmp"
-        _err "无法安装指定 Xray 版本 v${version}"
-        return 1
-    }
-
-    # 安装 geoip/geosite 数据文件
-    mkdir -p /usr/local/share/xray
-    cp "$tmp"/*.dat /usr/local/share/xray/ 2>/dev/null || true
-
-    rm -rf "$tmp"
-
-    if ! "$XRAY_BIN" version >/dev/null 2>&1; then
-        _err "Xray 已下载但无法执行"
-        if [[ "$PKG_MGR" == "apk" ]]; then
-            _warn "Alpine 需要 glibc 兼容层: apk add gcompat"
+    mkdir -p /usr/local/share/xray || return 1
+    for data in geoip.dat geosite.dat; do
+        if [[ ! -f "/usr/local/share/xray/$data" && -f "$tmp/$data" ]]; then
+            install -m 644 "$tmp/$data" "/usr/local/share/xray/$data" || return 1
         fi
-        return 1
+    done
+    if [[ -f "$XRAY_CONFIG" ]]; then
+        XRAY_LOCATION_ASSET=/usr/local/share/xray "$tmp/xray" run -test -c "$XRAY_CONFIG" || {
+            _err "指定版本无法加载现有配置，旧版本未修改"
+            return 1
+        }
     fi
 
-    local installed_ver
-    installed_ver=$("$XRAY_BIN" version 2>/dev/null | head -n1 | awk '{print $2}')
-    _ok "Xray ${installed_ver:-v$version} 安装完成"
-}
+    # 同文件系统原子替换，不覆盖正在执行的 inode；保留上一版本供恢复。
+    if [[ -f "$XRAY_BIN" ]]; then
+        cp -p "$XRAY_BIN" "$tmp/previous" && mv -f "$tmp/previous" "$XRAY_BIN.previous" || return 1
+    fi
+    mv -f "$tmp/xray" "$XRAY_BIN" || return 1
+    if check_cmd restorecon && ! restorecon "$XRAY_BIN"; then
+        [[ -f "$XRAY_BIN.previous" ]] && mv -f "$XRAY_BIN.previous" "$XRAY_BIN"
+        _err "Xray 安全标签恢复失败"
+        return 1
+    fi
+    _ok "Xray v${version} 已安装"
+)
 
 #═══════════════════════════════════════════════════════════════════════════════
 #  密钥生成
@@ -804,7 +833,7 @@ install_xray() {
 gen_keys() {
     _info "生成 Reality 密钥对..."
     local keys
-    keys=$("$XRAY_BIN" x25519 2>/dev/null)
+    keys=$("$XRAY_BIN" x25519) || return 1
 
     # 兼容新旧输出格式:
     #   旧版: "Private key: xxx" / "Public key: xxx"
@@ -815,17 +844,13 @@ gen_keys() {
 
     if [[ -z "$private_key" || -z "$public_key" ]]; then
         _err "密钥生成失败 (xray x25519 输出异常)"
-        _err "原始输出: $keys"
         return 1
     fi
 
-    echo "$private_key" > "$CFG/private.key"
-    echo "$public_key" > "$CFG/public.key"
-    chmod 600 "$CFG/private.key"
-
-    _ok "密钥对已生成"
-    echo -e "  ${D}PrivateKey: ${private_key}${NC}"
-    echo -e "  ${D}PublicKey:  ${public_key}${NC}"
+    (umask 077; printf '%s\n' "$private_key" > "$CFG/private.key") || return 1
+    printf '%s\n' "$public_key" > "$CFG/public.key" || return 1
+    chmod 600 "$CFG/private.key" || return 1
+    _ok "密钥对已生成（私钥不输出到终端）"
 }
 
 gen_short_id() {
@@ -1125,37 +1150,16 @@ select_sni_domain() {
 #═══════════════════════════════════════════════════════════════════════════════
 
 build_clients_json() {
-    # 从用户目录构建 clients JSON
-    local clients="[]"
-    if [[ -d "$USERS_DIR" ]]; then
-        for user_file in "$USERS_DIR"/*.json; do
-            [[ -f "$user_file" ]] || continue
-            local enabled uuid email
-            enabled=$(jq -r '.enabled // true' "$user_file")
-            [[ "$enabled" != "true" ]] && continue
-
-            uuid=$(jq -r '.uuid' "$user_file")
-            email=$(jq -r '.email // "user"' "$user_file")
-
-            [[ -z "$uuid" || "$uuid" == "null" ]] && continue
-
-            clients=$(echo "$clients" | jq \
-                --arg u "$uuid" \
-                --arg e "$email" \
-                '. += [{"id": $u, "email": $e, "flow": "xtls-rprx-vision"}]')
-        done
-    fi
-
-    # 确保至少有一个默认用户
-    if [[ "$clients" == "[]" ]]; then
-        local default_uuid
-        default_uuid=$(db_get_field '.default_uuid')
-        [[ -z "$default_uuid" ]] && return 1
-        clients=$(echo "[]" | jq --arg u "$default_uuid" \
-            '. += [{"id": $u, "email": "default", "flow": "xtls-rprx-vision"}]')
-    fi
-
-    echo "$clients"
+    local user_file files=()
+    for user_file in "$USERS_DIR"/*.json; do
+        [[ -f "$user_file" ]] && files+=("$user_file")
+    done
+    if [[ ${#files[@]} -eq 0 ]]; then printf '[]\n'; return 0; fi
+    jq -s '
+        map(select((if has("enabled") then .enabled else true end) == true)) |
+        map(if (.uuid | type) != "string" or .uuid == "" then error("用户缺少 UUID")
+            else {id: .uuid, email: (.email // "user"), flow: "xtls-rprx-vision"} end)
+    ' "${files[@]}"
 }
 
 generate_xray_config() {
@@ -1180,11 +1184,11 @@ generate_xray_config() {
     short_ids_json=$(echo "$short_ids" | tr ' ' '\n' | jq -R . | jq -s .)
 
     local clients
-    clients=$(build_clients_json)
-    [[ -z "$clients" || "$clients" == "[]" ]] && { _err "无有效用户"; return 1; }
+    clients=$(build_clients_json) || return 1
+    [[ -z "$clients" ]] && { _err "无法读取用户配置"; return 1; }
 
     local tmp
-    tmp=$(mktemp)
+    tmp=$(mktemp "$CFG/.xray.XXXXXX") || return 1
 
     jq -n \
         --argjson internal_port "$XRAY_INTERNAL_PORT" \
@@ -1228,19 +1232,14 @@ generate_xray_config() {
                 {type: "field", ip: ["geoip:private"], outboundTag: "block"}
             ]
         }
-    }' > "$tmp"
+    }' > "$tmp" || { rm -f "$tmp"; return 1; }
 
-    mv "$tmp" "$XRAY_CONFIG"
-
-    # 校验配置是否合法
-    if [[ -x "$XRAY_BIN" ]]; then
-        if ! "$XRAY_BIN" -test -c "$XRAY_CONFIG" >/dev/null 2>&1; then
-            _err "Xray 配置校验失败，请检查日志:"
-            "$XRAY_BIN" -test -c "$XRAY_CONFIG" 2>&1 | tail -10
-            return 1
-        fi
+    if ! "$XRAY_BIN" run -test -c "$tmp"; then
+        rm -f "$tmp"
+        _err "Xray 配置校验失败，原配置未修改"
+        return 1
     fi
-
+    mv -f "$tmp" "$XRAY_CONFIG" || { rm -f "$tmp"; return 1; }
     _ok "Xray 配置已生成: $XRAY_CONFIG"
 }
 
@@ -1261,7 +1260,7 @@ list_users() {
             name=$(basename "$user_file" .json)
             email=$(jq -r '.email // "user"' "$user_file")
             uuid=$(jq -r '.uuid' "$user_file")
-            enabled=$(jq -r '.enabled // true' "$user_file")
+            enabled=$(jq -r 'if has("enabled") then .enabled else true end' "$user_file")
             created=$(jq -r '.created // "N/A"' "$user_file")
 
             local status_icon status_text
@@ -1297,8 +1296,8 @@ add_user() {
 
     read -rp "  用户名 (英文，用于标识): " name
     name=$(echo "$name" | xargs | tr ' ' '-')
-    if [[ -z "$name" ]]; then
-        _err "用户名不能为空"
+    if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$ ]]; then
+        _err "用户名需为 1-64 位字母、数字、下划线或连字符，以字母或数字开头"
         return 1
     fi
     if [[ -f "$USERS_DIR/${name}.json" ]]; then
@@ -1325,15 +1324,13 @@ add_user() {
         --arg uuid "$uuid" \
         --arg created "$created" \
         '{email: $email, uuid: $uuid, enabled: true, created: $created}' \
-        > "$USERS_DIR/${name}.json"
+        > "$USERS_DIR/${name}.json" || return 1
 
     _ok "用户 $name 已添加"
     echo -e "  ${D}UUID: $uuid${NC}"
 
     # 重新生成配置并重启
-    if generate_xray_config 2>/dev/null; then
-        restart_xray
-    fi
+    apply_xray_changes || return 1
 }
 
 delete_user() {
@@ -1354,7 +1351,7 @@ delete_user() {
         local name email enabled
         name=$(basename "$user_file" .json)
         email=$(jq -r '.email // "user"' "$user_file")
-        enabled=$(jq -r '.enabled // true' "$user_file")
+        enabled=$(jq -r 'if has("enabled") then .enabled else true end' "$user_file")
         user_names+=("$name")
 
         local status
@@ -1373,14 +1370,12 @@ delete_user() {
     local target="${user_names[$((choice-1))]}"
     echo -e "  ${R}确认删除用户: $target ? [y/N]:${NC}"
     read -rp "  " confirm
-    [[ "${confirm,,}" != "y" ]] && { _info "已取消"; return; }
+    [[ "$confirm" != [yY] ]] && { _info "已取消"; return; }
 
-    rm -f "$USERS_DIR/${target}.json"
+    rm -f "$USERS_DIR/${target}.json" || return 1
     _ok "用户 $target 已删除"
 
-    if generate_xray_config 2>/dev/null; then
-        restart_xray
-    fi
+    apply_xray_changes || return 1
 }
 
 toggle_user() {
@@ -1400,7 +1395,7 @@ toggle_user() {
         local name email enabled
         name=$(basename "$user_file" .json)
         email=$(jq -r '.email // "user"' "$user_file")
-        enabled=$(jq -r '.enabled // true' "$user_file")
+        enabled=$(jq -r 'if has("enabled") then .enabled else true end' "$user_file")
         user_names+=("$name")
 
         local status
@@ -1419,7 +1414,7 @@ toggle_user() {
     local target="${user_names[$((choice-1))]}"
     local user_file="$USERS_DIR/${target}.json"
     local current
-    current=$(jq -r '.enabled // true' "$user_file")
+    current=$(jq -r 'if has("enabled") then .enabled else true end' "$user_file")
 
     local new_state
     if [[ "$current" == "true" ]]; then
@@ -1431,13 +1426,11 @@ toggle_user() {
     fi
 
     local tmp
-    tmp=$(mktemp)
-    jq --argjson e "$new_state" '.enabled = $e' "$user_file" > "$tmp"
-    mv "$tmp" "$user_file"
+    tmp=$(mktemp "$USERS_DIR/.user.XXXXXX") || return 1
+    jq --argjson e "$new_state" '.enabled = $e' "$user_file" > "$tmp" && \
+        mv "$tmp" "$user_file" || { rm -f "$tmp"; return 1; }
 
-    if generate_xray_config 2>/dev/null; then
-        restart_xray
-    fi
+    apply_xray_changes || return 1
 }
 
 show_user_links() {
@@ -1445,10 +1438,11 @@ show_user_links() {
     echo -e "  ${W}用户分享链接${NC}"
     _line
 
-    local port sni short_id public_key ipv4 ipv6
+    local port sni short_id public_key ipv4 ipv6 default_uuid
     port=$(db_get_field '.port')
     sni=$(db_get_field '.sni')
     short_id=$(db_get_field '.short_id')
+    default_uuid=$(db_get_field '.default_uuid')
     public_key=$(cat "$CFG/public.key" 2>/dev/null || db_get_field '.public_key')
     ipv4=$(get_ipv4)
     ipv6=$(get_ipv6)
@@ -1469,22 +1463,24 @@ show_user_links() {
         name=$(basename "$user_file" .json)
         email=$(jq -r '.email // "user"' "$user_file")
         uuid=$(jq -r '.uuid' "$user_file")
-        enabled=$(jq -r '.enabled // true' "$user_file")
+        enabled=$(jq -r 'if has("enabled") then .enabled else true end' "$user_file")
 
         [[ "$enabled" != "true" ]] && continue
 
         echo -e "  ${W}${name}${NC} (${email})"
 
         if [[ -n "$ipv4" ]]; then
-            local link4
-            link4=$(build_vless_link "$uuid" "$ipv4" "$port" "$sni" "$public_key" "$short_id" "$name")
+            local link4 name4="$name"
+            [[ "$uuid" == "$default_uuid" ]] && name4="VLESS-${ipv4}"
+            link4=$(build_vless_link "$uuid" "$ipv4" "$port" "$sni" "$public_key" "$short_id" "$name4")
             echo -e "  ${G}IPv4: ${link4}${NC}"
             show_qr "$link4"
         fi
 
         if [[ -n "$ipv6" ]]; then
-            local link6
-            link6=$(build_vless_link "$uuid" "$ipv6" "$port" "$sni" "$public_key" "$short_id" "$name")
+            local link6 name6="$name"
+            [[ "$uuid" == "$default_uuid" ]] && name6="VLESS-${ipv6}"
+            link6=$(build_vless_link "$uuid" "$ipv6" "$port" "$sni" "$public_key" "$short_id" "$name6")
             echo -e "  ${G}IPv6: ${link6}${NC}"
             show_qr "$link6"
         fi
@@ -1507,7 +1503,7 @@ manage_users() {
                 [[ -f "$f" ]] || continue
                 ((total++))
                 local e
-                e=$(jq -r '.enabled // true' "$f")
+                e=$(jq -r 'if has("enabled") then .enabled else true end' "$f")
                 [[ "$e" == "true" ]] && ((enabled_count++))
             done
         fi
@@ -1544,36 +1540,43 @@ do_install() {
     echo -e "  ${W}VLESS Reality 安装向导${NC}"
     _line
 
-    # 1. 检测系统
     _info "系统: $DISTRO (包管理器: $PKG_MGR, 服务: $SVC_MGR)"
+    case "$PKG_MGR" in apk|dnf|yum|apt) ;; *) _err "不支持的包管理器"; return 1 ;; esac
+    case "$SVC_MGR" in openrc|systemd) ;; *) _err "不支持的服务管理器"; return 1 ;; esac
+    install_deps || { _err "依赖安装失败，请检查软件源"; return 1; }
+    install_nginx || { _err "Nginx 安装失败"; return 1; }
+    install_xray || { _err "Xray 安装失败"; return 1; }
+    init_db || return 1
+
+    if [[ -f "$XRAY_CONFIG" ]] || jq -e '
+        (.sni | type == "string" and length > 0) and
+        ((.short_ids // .short_id) | type == "string" and length > 0) and
+        (.private_key | type == "string" and length > 0) and
+        (.public_key | type == "string" and length > 0) and
+        (.port | type == "number")
+    ' "$DB_FILE" >/dev/null; then
+        _info "保留现有账号、密钥、端口和 SNI，应用指定版本并重启服务"
+        local existing_port
+        existing_port=$(db_get_field '.port') || return 1
+        open_firewall_port "$existing_port" || return 1
+        generate_xray_config || return 1
+        generate_nginx_sni_config || return 1
+        start_proxy_services || { _err "重装未完成，请检查服务日志"; return 1; }
+        _ok "重装完成，现有凭据未重置"
+        return 0
+    fi
+
     local ipv4 ipv6 ipv4_nat=false
     ipv4=$(get_ipv4)
     ipv6=$(get_ipv6)
     echo -e "  IPv4: ${ipv4:-${R}无${NC}}"
     echo -e "  IPv6: ${ipv6:-${R}无${NC}}"
     [[ -z "$ipv4" && -z "$ipv6" ]] && { _err "无法获取公网 IP"; return 1; }
-    if [[ -n "$ipv4" ]] && ipv4_is_nat; then
+    if [[ -n "$ipv4" ]] && ipv4_is_nat "$ipv4"; then
         ipv4_nat=true
         echo -e "  ${Y}提示:${NC} 本机 IPv4 是 NAT 内网地址，公网 ${W}${ipv4}${NC} 需要在 NAT/安全组做端口转发才能入站"
         [[ -n "$ipv6" ]] && echo -e "  ${Y}提示:${NC} IPv6 为直连，推荐优先使用 IPv6 链接"
     fi
-    echo ""
-
-    # 2. 安装依赖
-    install_deps || { _err "依赖安装失败，请检查软件源"; return 1; }
-
-    # 3. 安装 Xray
-    install_xray || { _err "Xray 安装失败"; return 1; }
-
-    # 3.5 安装 Nginx (SNI 分流防薅)
-    install_nginx || { _err "Nginx 安装失败"; return 1; }
-
-    # 4. 生成密钥
-    init_db
-    gen_keys
-    local private_key public_key
-    private_key=$(cat "$CFG/private.key")
-    public_key=$(cat "$CFG/public.key")
     echo ""
 
     # 5. 选择端口
@@ -1592,15 +1595,13 @@ do_install() {
         2) port=$random_high_port ;;
         c|C)
             read -rp "  输入端口号 (1-65535): " port
-            [[ ! "$port" =~ ^[0-9]+$ || "$port" -lt 1 || "$port" -gt 65535 ]] && {
-                _warn "无效端口，使用默认 443"
-                port=443
-            }
+            valid_port "$port" || { _err "无效端口或与 Xray 内部端口冲突"; return 1; }
+            port=$((10#$port))
             ;;
         *) port=443 ;;
     esac
     _info "端口: $port"
-    open_firewall_port "$port"
+    open_firewall_port "$port" || return 1
     echo ""
 
     # 6. 选择 SNI 域名
@@ -1627,16 +1628,29 @@ do_install() {
     _info "默认 UUID: $default_uuid"
     echo ""
 
+    if [[ -s "$CFG/private.key" && -s "$CFG/public.key" ]]; then
+        _info "复用未完成安装留下的密钥对"
+    elif [[ -e "$CFG/private.key" || -e "$CFG/public.key" ]]; then
+        _err "已有密钥文件不完整，请恢复密钥备份后重试；不会覆盖现有密钥"
+        return 1
+    else
+        gen_keys || return 1
+    fi
+    local private_key public_key
+    private_key=$(cat "$CFG/private.key") || return 1
+    public_key=$(cat "$CFG/public.key") || return 1
+    [[ -n "$default_uuid" && -n "$short_ids" ]] || return 1
+
     # 9. 保存配置到数据库
     db_set_field --arg port "$port" --arg sni "$sni" \
         --arg pk "$private_key" --arg pub "$public_key" \
         --arg sids "$short_ids" --arg sid "$first_short_id" \
         --arg uuid "$default_uuid" --arg email "$default_email" \
         --arg dest "${sni}:443" \
-        '.port=($port|tonumber) | .sni=$sni | .private_key=$pk | .public_key=$pub | .short_ids=$sids | .short_id=$sid | .default_uuid=$uuid | .default_email=$email | .dest=$dest'
+        '.port=($port|tonumber) | .sni=$sni | .private_key=$pk | .public_key=$pub | .short_ids=$sids | .short_id=$sid | .default_uuid=$uuid | .default_email=$email | .dest=$dest' || return 1
 
     # 10. 创建默认用户文件
-    mkdir -p "$USERS_DIR"
+    mkdir -p "$USERS_DIR" || return 1
     local created
     created=$(date '+%Y-%m-%d %H:%M')
     jq -n \
@@ -1644,43 +1658,14 @@ do_install() {
         --arg uuid "$default_uuid" \
         --arg created "$created" \
         '{email: $email, uuid: $uuid, enabled: true, created: $created}' \
-        > "$USERS_DIR/${default_email}.json"
+        > "$USERS_DIR/${default_email}.json" || return 1
 
     # 11. 生成 Xray 配置 (监听 127.0.0.1:8443)
     generate_xray_config || { _err "配置生成失败"; return 1; }
 
     # 11.5 生成 Nginx SNI 分流配置 (监听 0.0.0.0:443)
     generate_nginx_sni_config || { _err "Nginx SNI 配置生成失败"; return 1; }
-    create_nginx_service
-
-    # 12. 创建并启动服务
-    create_xray_service
-    svc start vless-reality
-    sleep 1
-    if is_service_active vless-reality; then
-        _ok "Xray 服务已启动"
-    else
-        _warn "Xray 启动异常"
-    fi
-
-    # 停止 Nginx 默认站点 (避免端口冲突)，启动 SNI 分流
-    # 清理默认站点配置 (Debian/Ubuntu 的 default site 可能占用 80/443)
-    rm -f /etc/nginx/sites-enabled/default 2>/dev/null
-    rm -f /etc/nginx/conf.d/default.conf 2>/dev/null
-    # 停掉可能占用端口的 nginx
-    svc stop nginx 2>/dev/null
-    sleep 1
-    svc start nginx
-    sleep 1
-    if is_service_active nginx; then
-        _ok "Nginx SNI 分流已启动"
-    else
-        _warn "Nginx 启动异常"
-    fi
-
-    # 13. 显示结果
-    local ipv6
-    ipv6=$(get_ipv6)
+    start_proxy_services || { _err "安装未完成，请检查服务日志和端口占用"; return 1; }
 
     echo ""
     _dline
@@ -1705,12 +1690,12 @@ do_install() {
 
     local link4 link6
     if [[ -n "$ipv4" ]]; then
-        link4=$(build_vless_link "$default_uuid" "$ipv4" "$port" "$sni" "$public_key" "$first_short_id" "VLESS-Reality")
+        link4=$(build_vless_link "$default_uuid" "$ipv4" "$port" "$sni" "$public_key" "$first_short_id" "VLESS-${ipv4}")
         echo -e "  ${G}IPv4: ${link4}${NC}"
         show_qr "$link4"
     fi
     if [[ -n "$ipv6" ]]; then
-        link6=$(build_vless_link "$default_uuid" "$ipv6" "$port" "$sni" "$public_key" "$first_short_id" "VLESS-Reality")
+        link6=$(build_vless_link "$default_uuid" "$ipv6" "$port" "$sni" "$public_key" "$first_short_id" "VLESS-${ipv6}")
         echo -e "  ${G}IPv6: ${link6}${NC}"
         show_qr "$link6"
     fi
@@ -1802,27 +1787,48 @@ show_full_info() {
     echo -e "  ${W}用户: ${total} 个${NC}"
     echo ""
 
-    # 分享链接
-    if [[ -n "$port" && -n "$sni" && -n "$public_key" && -n "$short_id" && -n "$default_uuid" ]]; then
-        echo -e "  ${W}分享链接:${NC}"
-        if [[ -n "$ipv4" ]]; then
-            local link4
-            link4=$(build_vless_link "$default_uuid" "$ipv4" "$port" "$sni" "$public_key" "$short_id" "VLESS-Reality")
-            echo -e "  ${G}IPv4: ${link4}${NC}"
-            show_qr "$link4"
-        fi
-        if [[ -n "$ipv6" ]]; then
-            local link6
-            link6=$(build_vless_link "$default_uuid" "$ipv6" "$port" "$sni" "$public_key" "$short_id" "VLESS-Reality")
-            echo -e "  ${G}IPv6: ${link6}${NC}"
-            show_qr "$link6"
-        fi
-    fi
+    echo -e "  ${D}使用 --links 查看当前启用用户的分享链接${NC}"
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
 #  修改配置
 #═══════════════════════════════════════════════════════════════════════════════
+
+apply_proxy_settings() (
+    local backup success=false xray_touched=false nginx_touched=false
+    local xray_was_active=false nginx_was_active=false
+    backup=$(mktemp -d "$CFG/.settings.XXXXXX") || return 1
+    cp -p "$DB_FILE" "$backup/db" && cp -p "$XRAY_CONFIG" "$backup/xray" && \
+        cp -p "$NGINX_SNI_CONF" "$backup/nginx" || { rm -rf "$backup"; return 1; }
+    is_service_active vless-reality && xray_was_active=true
+    is_service_active nginx && nginx_was_active=true
+    trap '
+        if [[ "$success" != true ]]; then
+            if cat "$backup/db" > "$DB_FILE" && cat "$backup/xray" > "$XRAY_CONFIG" &&
+                cat "$backup/nginx" > "$NGINX_SNI_CONF"; then
+                if [[ "$xray_touched" == true ]]; then
+                    if [[ "$xray_was_active" == true ]]; then restart_xray; else svc stop vless-reality; fi || _err "Xray 旧服务恢复失败"
+                fi
+                if [[ "$nginx_touched" == true ]]; then
+                    if [[ "$nginx_was_active" == true ]]; then restart_nginx; else svc stop nginx; fi || _err "Nginx 旧服务恢复失败"
+                fi
+                _err "配置变更失败，已恢复原配置；请确认服务状态"
+            else
+                _err "配置恢复失败，备份保留在 $backup"
+                exit 1
+            fi
+        fi
+        rm -rf "$backup"
+    ' EXIT
+    db_set_field "$@" || return 1
+    generate_xray_config || return 1
+    generate_nginx_sni_config || return 1
+    xray_touched=true
+    restart_xray || return 1
+    nginx_touched=true
+    restart_nginx || return 1
+    success=true
+)
 
 change_port() {
     local current_port new_port
@@ -1830,17 +1836,11 @@ change_port() {
     echo -e "  当前端口: ${W}${current_port}${NC}"
     read -rp "  新端口 [443]: " new_port
     new_port=${new_port:-443}
-    [[ ! "$new_port" =~ ^[0-9]+$ ]] && { _err "无效端口"; return; }
-
-    db_set_field --arg p "$new_port" '.port=($p|tonumber)'
+    valid_port "$new_port" || { _err "无效端口或与 Xray 内部端口冲突"; return 1; }
+    new_port=$((10#$new_port))
+    open_firewall_port "$new_port" || return 1
+    apply_proxy_settings --argjson p "$new_port" '.port=$p' || return 1
     _ok "端口已改为 $new_port"
-    open_firewall_port "$new_port"
-
-    # 同时更新 Xray 和 Nginx SNI 配置 (Nginx 监听端口也需同步)
-    if generate_xray_config 2>/dev/null; then
-        generate_nginx_sni_config 2>/dev/null
-        restart_xray
-    fi
 }
 
 change_sni() {
@@ -1856,30 +1856,23 @@ change_sni() {
         fi
     done
 
-    db_set_field --arg s "$new_sni" --arg d "${new_sni}:443" '.sni=$s | .dest=$d'
+    apply_proxy_settings --arg s "$new_sni" --arg d "${new_sni}:443" '.sni=$s | .dest=$d' || return 1
     _ok "SNI 已改为 $new_sni"
-
-    if generate_xray_config 2>/dev/null; then
-        generate_nginx_sni_config 2>/dev/null
-        restart_xray
-    fi
 }
 
 rotate_keys() {
     echo -e "  ${Y}重新生成密钥对会使所有客户端连接失效!${NC}"
     read -rp "  确认? [y/N]: " confirm
-    [[ "${confirm,,}" != "y" ]] && return
+    [[ "$confirm" != [yY] ]] && return
 
-    gen_keys
+    gen_keys || return 1
     local pk pub
-    pk=$(cat "$CFG/private.key")
-    pub=$(cat "$CFG/public.key")
-    db_set_field --arg pk "$pk" --arg pub "$pub" '.private_key=$pk | .public_key=$pub'
+    pk=$(cat "$CFG/private.key") || return 1
+    pub=$(cat "$CFG/public.key") || return 1
+    db_set_field --arg pk "$pk" --arg pub "$pub" '.private_key=$pk | .public_key=$pub' || return 1
     _ok "密钥已更新"
 
-    if generate_xray_config 2>/dev/null; then
-        restart_xray
-    fi
+    apply_xray_changes || return 1
     echo -e "  ${W}新 PublicKey: ${G}${pub}${NC}"
     echo -e "  ${Y}请更新所有客户端的 PublicKey${NC}"
 }
@@ -1892,7 +1885,7 @@ do_uninstall() {
     echo -e "  ${R}即将完全卸载 VLESS Reality CF${NC}"
     echo -e "  ${Y}将删除: Xray 配置、用户数据、Nginx SNI 配置、服务${NC}"
     read -rp "  确认卸载? [y/N]: " confirm
-    [[ "${confirm,,}" != "y" ]] && return
+    [[ "$confirm" != [yY] ]] && return
 
     _info "停止服务..."
     svc stop vless-reality 2>/dev/null
@@ -2056,7 +2049,7 @@ main_menu() {
             8) [[ -f "$XRAY_CONFIG" ]] && { show_logs; _pause; } || { _err "请先安装"; _pause; } ;;
             9)
                 if [[ -f "$XRAY_CONFIG" ]]; then
-                    restart_xray; _pause
+                    start_proxy_services; _pause
                 else
                     _err "请先安装"; _pause
                 fi
@@ -2105,7 +2098,7 @@ readonly XRAY_VERSION
 
 case "${1:-}" in
     --install)
-        check_root; init_db; do_install
+        check_root; do_install
         ;;
     --uninstall)
         check_root; do_uninstall
@@ -2129,7 +2122,7 @@ case "${1:-}" in
         echo "用法: $0 [选项]"
         echo ""
         echo "选项:"
-        echo "  --install          直接安装 (非交互)"
+        echo "  --install          进入安装向导（重装保留账号和密钥）"
         echo "  --xray-version <版本> 指定 Xray 版本 (默认固定 26.11.9，可带 v 前缀)"
         echo "  --uninstall        完全卸载"
         echo "  --status           显示配置状态"
