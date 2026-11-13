@@ -1,18 +1,40 @@
-#!/bin/bash
+#!/bin/sh
 #═══════════════════════════════════════════════════════════════════════════════
-#  VLESS Reality + CF CDN 域名一键部署脚本 v1.0.0
+#  VLESS Reality + CF CDN 域名一键部署脚本 v1.1.0
 #
 #  功能: VLESS+Reality 偷 CF CDN 域名 + SNI 校验 + 用户管理
-#  适配: Debian/Ubuntu/CentOS/Alpine
+#  适配: Debian/Ubuntu/CentOS/RHEL/Alma/Rocky/Fedora/Alpine
 #
 #  基于: https://github.com/Zyx0rx/vless-all-in-one (v3.5.3)
 #        精简为仅 VLESS Reality + CF 域名 + 用户管理
 #═══════════════════════════════════════════════════════════════════════════════
 
+# Alpine 只有 BusyBox ash 且默认不装 bash。用 /bin/sh 起头自举 bash 再重新执行自身，
+# 避免 "bad interpreter: /bin/bash" 直接失败。这一段必须是 POSIX sh 语法。
+if [ -z "${BASH_VERSION:-}" ]; then
+    if ! command -v bash >/dev/null 2>&1; then
+        if command -v apk >/dev/null 2>&1; then
+            apk add --no-cache bash >/dev/null 2>&1
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y bash >/dev/null 2>&1
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y bash >/dev/null 2>&1
+        elif command -v apt-get >/dev/null 2>&1; then
+            apt-get update -qq >/dev/null 2>&1
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bash >/dev/null 2>&1
+        fi
+    fi
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" "$@"
+    fi
+    echo "本脚本依赖 bash，自动安装失败，请先手动安装 bash 再运行。" >&2
+    exit 1
+fi
+
 # 不启用 set -e，交互式脚本中很多命令预期返回非零 (grep/curl/jq 等)
 # set -euo pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly CFG="/etc/vless-reality-cf"
 readonly DB_FILE="$CFG/db.json"
 readonly XRAY_BIN="/usr/local/bin/xray"
@@ -38,7 +60,9 @@ _CACHED_IPV6=""
 
 if [[ -f /etc/alpine-release ]]; then
     DISTRO="alpine"
-elif [[ -f /etc/centos-release ]] || [[ -f /etc/redhat-release ]]; then
+elif [[ -f /etc/centos-release ]] || [[ -f /etc/almalinux-release ]] || \
+     [[ -f /etc/rocky-release ]]   || [[ -f /etc/fedora-release ]] || \
+     [[ -f /etc/redhat-release ]]; then
     DISTRO="centos"
 elif grep -qi ubuntu /etc/os-release 2>/dev/null; then
     DISTRO="ubuntu"
@@ -46,6 +70,22 @@ elif grep -qi debian /etc/os-release 2>/dev/null; then
     DISTRO="debian"
 else
     DISTRO="unknown"
+fi
+
+# 包管理器按实际存在的命令判断，不依赖发行版名字
+if   command -v apk     >/dev/null 2>&1; then PKG_MGR="apk"
+elif command -v dnf     >/dev/null 2>&1; then PKG_MGR="dnf"
+elif command -v yum     >/dev/null 2>&1; then PKG_MGR="yum"
+elif command -v apt-get >/dev/null 2>&1; then PKG_MGR="apt"
+else PKG_MGR="unknown"; fi
+
+# 服务管理器同理：openrc 与 systemd 都可能出现在非预期发行版上
+if command -v rc-service >/dev/null 2>&1 && [[ -d /etc/runlevels ]]; then
+    SVC_MGR="openrc"
+elif command -v systemctl >/dev/null 2>&1; then
+    SVC_MGR="systemd"
+else
+    SVC_MGR="unknown"
 fi
 
 check_root() { if [[ $EUID -ne 0 ]]; then _err "请使用 root 权限运行"; exit 1; fi; }
@@ -174,6 +214,17 @@ get_ipv6() {
     echo "$result"
 }
 
+# 本机网卡上只有私网/CGNAT 地址 → 公网 IPv4 靠 NAT 映射，入站必须做端口转发
+ipv4_is_nat() {
+    local cidr
+    for cidr in $(ip addr show 2>/dev/null | awk '$1=="inet"{print $2}'); do
+        if ! _is_public_ipv4 "${cidr%%/*}"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 urlencode() {
     local s="$1" i c o=""
     for ((i=0; i<${#s}; i++)); do
@@ -254,39 +305,112 @@ db_set_field() {
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
-#  服务管理
+#  包管理 (apk / dnf / yum / apt)
+#═══════════════════════════════════════════════════════════════════════════════
+
+pkg_refresh() {
+    case "$PKG_MGR" in
+        apk) apk update -q >/dev/null 2>&1 ;;
+        dnf) dnf makecache -q >/dev/null 2>&1 ;;
+        yum) yum makecache -q >/dev/null 2>&1 ;;
+        apt) apt-get update -qq >/dev/null 2>&1 ;;
+    esac
+}
+
+pkg_install() {
+    [[ $# -eq 0 ]] && return 0
+    case "$PKG_MGR" in
+        apk) apk add --no-cache "$@" >/dev/null 2>&1 ;;
+        dnf) dnf install -y -q "$@" >/dev/null 2>&1 ;;
+        yum) yum install -y -q "$@" >/dev/null 2>&1 ;;
+        apt) DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 可选依赖逐个安装：某个包在仓库里不存在时不会拖垮整批
+pkg_install_optional() {
+    local p
+    for p in "$@"; do
+        pkg_install "$p" || true
+    done
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+#  服务管理 (openrc / systemd)
 #═══════════════════════════════════════════════════════════════════════════════
 
 svc() {
     local cmd="$1" name="$2"
-    if [[ "$DISTRO" == "alpine" ]]; then
-        rc-service "$name" "$cmd" 2>/dev/null
-    else
-        systemctl "$cmd" "$name" 2>/dev/null
-    fi
+    case "$SVC_MGR" in
+        openrc)  rc-service "$name" "$cmd" 2>/dev/null ;;
+        systemd) systemctl "$cmd" "$name" 2>/dev/null ;;
+        *)       return 1 ;;
+    esac
 }
 
-# 判断服务是否正在运行（比 grep status 输出更可靠）
+# 判断服务是否正在运行（rc-service status 退出码 / systemctl is-active）
 is_service_active() {
     local name="$1"
-    if [[ "$DISTRO" == "alpine" ]]; then
-        rc-service "$name" status 2>/dev/null | grep -qi "started\|running"
+    case "$SVC_MGR" in
+        openrc)  rc-service "$name" status >/dev/null 2>&1 ;;
+        systemd) systemctl is-active --quiet "$name" 2>/dev/null ;;
+        *)       return 1 ;;
+    esac
+}
+
+# openrc 的 restart 不能作用于未启动的服务，统一成 restart-or-start
+svc_up() {
+    local name="$1"
+    if is_service_active "$name"; then
+        svc restart "$name"
     else
-        systemctl is-active --quiet "$name" 2>/dev/null
+        svc start "$name"
     fi
 }
 
 create_xray_service() {
-    if [[ "$DISTRO" == "alpine" ]]; then
-        cat > /etc/init.d/vless-reality <<'EOF'
+    if [[ "$SVC_MGR" == "openrc" ]]; then
+        # 有 supervise-daemon 就托管进程（崩溃自动拉起），否则退化为后台运行
+        if command -v supervise-daemon >/dev/null 2>&1; then
+            cat > /etc/init.d/vless-reality <<'EOF'
 #!/sbin/openrc-run
 name="vless-reality"
+description="VLESS Reality CF Proxy"
 command="/usr/local/bin/xray"
 command_args="run -c /etc/vless-reality-cf/xray.json"
-command_background=true
-pidfile="/run/vless-reality.pid"
-depend() { need net; }
+command_user="root"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/vless-reality.log"
+error_log="/var/log/vless-reality.log"
+
+depend() {
+    need net
+    after firewall
+}
 EOF
+        else
+            cat > /etc/init.d/vless-reality <<'EOF'
+#!/sbin/openrc-run
+name="vless-reality"
+description="VLESS Reality CF Proxy"
+command="/usr/local/bin/xray"
+command_args="run -c /etc/vless-reality-cf/xray.json"
+command_user="root"
+command_background="yes"
+pidfile="/run/vless-reality.pid"
+output_log="/var/log/vless-reality.log"
+error_log="/var/log/vless-reality.log"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+        fi
         chmod +x /etc/init.d/vless-reality
         rc-update add vless-reality default 2>/dev/null
     else
@@ -313,7 +437,7 @@ EOF
 }
 
 restart_xray() {
-    svc restart vless-reality
+    svc_up vless-reality
     sleep 1
     if is_service_active vless-reality; then
         _ok "Xray 已重启"
@@ -331,25 +455,40 @@ restart_xray() {
 #═══════════════════════════════════════════════════════════════════════════════
 
 install_deps() {
-    _info "安装基础依赖..."
-    case "$DISTRO" in
-        alpine)
-            apk update -q 2>/dev/null
-            apk add --no-cache curl jq openssl ca-certificates coreutils unzip qrencode >/dev/null 2>&1
-            # gcompat 兼容层
-            apk add --no-cache gcompat libc6-compat >/dev/null 2>&1
+    _info "安装基础依赖 (包管理器: $PKG_MGR)..."
+    pkg_refresh
+
+    local base="curl jq ca-certificates unzip"
+    case "$PKG_MGR" in
+        apk)
+            # gcompat: Xray 官方二进制是 glibc 构建，Alpine(musl) 需要兼容层
+            # iproute2: 提供 ip / ss；coreutils: 提供完整 install/stat
+            pkg_install $base openssl coreutils iproute2 gcompat
+            pkg_install_optional libqrencode-tools
             ;;
-        centos)
-            yum install -y -q curl jq openssl ca-certificates coreutils unzip qrencode >/dev/null 2>&1
+        dnf|yum)
+            # CentOS 7 的 jq / qrencode / nginx 都在 EPEL
+            pkg_install_optional epel-release
+            pkg_install $base openssl coreutils iproute
+            pkg_install_optional qrencode
             ;;
-        debian|ubuntu)
-            apt-get update -qq >/dev/null 2>&1
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl jq openssl ca-certificates coreutils unzip qrencode >/dev/null 2>&1
+        apt)
+            pkg_install $base openssl coreutils iproute2
+            pkg_install_optional qrencode
             ;;
         *)
-            _warn "未知发行版，请手动安装: curl jq openssl unzip qrencode"
+            _warn "未知包管理器，请手动安装: curl jq openssl unzip"
             ;;
     esac
+
+    local missing="" c
+    for c in curl jq unzip; do
+        check_cmd "$c" || missing="$missing $c"
+    done
+    if [[ -n "$missing" ]]; then
+        _warn "缺少关键依赖:$missing"
+        return 1
+    fi
     _ok "依赖安装完成"
 }
 
@@ -363,72 +502,63 @@ install_deps() {
 #  其他 SNI 直接黑洞，从根源阻断薅羊毛。
 #═══════════════════════════════════════════════════════════════════════════════
 
-install_nginx() {
-    if check_cmd nginx; then
-        # 检查是否有 stream 模块 (静态编译或动态模块 .so 文件存在)
-        local has_stream=false
-        if nginx -V 2>&1 | grep -q "with-stream\b\|with-stream=dynamic"; then
-            # 如果是动态模块，检查 .so 文件是否存在
-            if nginx -V 2>&1 | grep -q "stream=dynamic"; then
-                for mod_path in /usr/lib/nginx/modules/ngx_stream_module.so \
-                                /usr/share/nginx/modules/ngx_stream_module.so \
-                                /etc/nginx/modules/ngx_stream_module.so; do
-                    [[ -f "$mod_path" ]] && has_stream=true && break
-                done
-                # .so 不存在但 nginx 支持动态 stream → 需要安装包
-                if [[ "$has_stream" == "false" ]]; then
-                    _info "安装 Nginx stream 动态模块..."
-                    case "$DISTRO" in
-                        debian|ubuntu)
-                            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libnginx-mod-stream >/dev/null 2>&1
-                            ;;
-                        centos)
-                            yum install -y -q nginx-mod-stream >/dev/null 2>&1
-                            ;;
-                    esac
-                    # 再检查一次
-                    for mod_path in /usr/lib/nginx/modules/ngx_stream_module.so \
-                                    /usr/share/nginx/modules/ngx_stream_module.so \
-                                    /etc/nginx/modules/ngx_stream_module.so; do
-                        [[ -f "$mod_path" ]] && has_stream=true && break
-                    done
-                fi
-            else
-                # 静态编译的 stream
-                has_stream=true
-            fi
-        fi
+# 查找 nginx stream 动态模块 .so
+find_nginx_stream_module() {
+    local p
+    for p in /usr/lib/nginx/modules/ngx_stream_module.so \
+             /usr/lib64/nginx/modules/ngx_stream_module.so \
+             /usr/share/nginx/modules/ngx_stream_module.so \
+             /etc/nginx/modules/ngx_stream_module.so; do
+        if [[ -f "$p" ]]; then echo "$p"; return 0; fi
+    done
+    return 1
+}
 
-        if [[ "$has_stream" == "true" ]]; then
-            _ok "Nginx 已安装 (含 stream 模块)"
-            return 0
-        else
-            _warn "Nginx 已安装但无法获取 stream 模块，重新安装..."
-        fi
+# stream 可用 = 静态编译，或动态编译且 .so 存在
+nginx_has_stream() {
+    local v
+    v=$(nginx -V 2>&1) || return 1
+    case "$v" in
+        *--with-stream=dynamic*) find_nginx_stream_module >/dev/null 2>&1 ;;
+        *--with-stream*)         return 0 ;;
+        *)                       return 1 ;;
+    esac
+}
+
+install_nginx() {
+    if check_cmd nginx && nginx_has_stream; then
+        _ok "Nginx 已安装 (含 stream 模块)"
+        return 0
     fi
 
     _info "安装 Nginx (含 stream 模块用于 SNI 分流)..."
-    case "$DISTRO" in
-        alpine)
-            apk add --no-cache nginx nginx-stream >/dev/null 2>&1 || \
-            apk add --no-cache nginx >/dev/null 2>&1
+    case "$PKG_MGR" in
+        apk)
+            pkg_install nginx nginx-mod-stream
+            # Alpine 把 init 脚本单独打包，缺了它 nginx 没有 /etc/init.d/nginx
+            pkg_install_optional nginx-openrc
             ;;
-        centos)
-            yum install -y -q nginx nginx-mod-stream >/dev/null 2>&1 || \
-            yum install -y -q nginx >/dev/null 2>&1
+        dnf|yum)
+            pkg_install nginx
+            # RHEL8+/CentOS8+ AppStream 提供 nginx-mod-stream；CentOS7(EPEL) 为静态编译
+            pkg_install_optional nginx-mod-stream
             ;;
-        debian|ubuntu)
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx libnginx-mod-stream >/dev/null 2>&1 || \
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx >/dev/null 2>&1
+        apt)
+            pkg_install nginx libnginx-mod-stream || pkg_install nginx
             ;;
     esac
 
-    if check_cmd nginx; then
+    if check_cmd nginx && nginx_has_stream; then
         _ok "Nginx 安装完成"
-    else
-        _err "Nginx 安装失败"
+        return 0
+    fi
+    if check_cmd nginx; then
+        _err "Nginx 缺少 stream 模块，SNI 分流无法工作"
+        _warn "Alpine: apk add nginx-mod-stream  Debian: apt install libnginx-mod-stream"
         return 1
     fi
+    _err "Nginx 安装失败"
+    return 1
 }
 
 generate_nginx_sni_config() {
@@ -478,68 +608,81 @@ EOF
 
     _ok "Nginx SNI 分流配置已生成: $NGINX_SNI_CONF"
 
-    # 确保 nginx.conf 包含 stream block
-    if ! grep -q "stream.conf.d" /etc/nginx/nginx.conf 2>/dev/null; then
-        # 检查是否需要 load_module (动态模块)
-        local need_load_module=false
-        if nginx -V 2>&1 | grep -q "stream=dynamic"; then
-            need_load_module=true
-        fi
-        # 检查动态模块文件是否存在
-        local stream_module=""
-        for mod_path in /usr/lib/nginx/modules/ngx_stream_module.so \
-                        /usr/share/nginx/modules/ngx_stream_module.so \
-                        /etc/nginx/modules/ngx_stream_module.so; do
-            if [[ -f "$mod_path" ]]; then
-                stream_module="$mod_path"
-                break
-            fi
-        done
+    ensure_stream_module_loaded
+    ensure_nginx_stream_include
+}
 
-        # 在 nginx.conf 最前面加 load_module (如果需要，且没被 modules-enabled 加载)
-        if [[ "$need_load_module" == "true" && -n "$stream_module" ]]; then
-            local already_loaded=false
-            # Debian 的 modules-enabled 机制会自动加载
-            if ls /etc/nginx/modules-enabled/*stream* 2>/dev/null | grep -q .; then
-                already_loaded=true
-            fi
-            # nginx.conf 里是否已有 load_module
-            if grep -q "ngx_stream_module" /etc/nginx/nginx.conf 2>/dev/null; then
-                already_loaded=true
-            fi
-            if [[ "$already_loaded" == "false" ]]; then
-                sed -i "1i\\load_module ${stream_module};" /etc/nginx/nginx.conf
-                _ok "已添加 load_module ngx_stream_module"
-            fi
-        fi
+# 动态编译的 stream 模块需要 load_module；三家发行版的自动加载机制各不相同
+ensure_stream_module_loaded() {
+    local stream_module
+    stream_module=$(find_nginx_stream_module 2>/dev/null)
+    [[ -z "$stream_module" ]] && return 0
 
-        # 在 nginx.conf 末尾追加 stream block (必须和 events/http 同级)
-        # 不能插入到 http{} 或 events{} 内部，必须 append 到文件末尾
-        if ! grep -q "stream.conf.d" /etc/nginx/nginx.conf 2>/dev/null; then
-            cat >> /etc/nginx/nginx.conf <<'STREAMEOF'
+    # nginx.conf 里已有 load_module 就直接用
+    if grep -q "ngx_stream_module" /etc/nginx/nginx.conf 2>/dev/null; then
+        return 0
+    fi
+
+    # 发行版通过 modules 目录自动加载（Debian/Alpine/RHEL 路径各不相同）
+    local d
+    for d in /etc/nginx/modules-enabled /etc/nginx/modules /etc/nginx/modules.conf.d /usr/share/nginx/modules; do
+        [[ -d "$d" ]] || continue
+        if grep -qE "include[[:space:]]+${d}/\*\.conf" /etc/nginx/nginx.conf 2>/dev/null && \
+           grep -ql "ngx_stream_module" "$d"/*.conf 2>/dev/null; then
+            return 0
+        fi
+    done
+
+    # busybox sed 不支持 GNU 的 "1i\" 写法，用临时文件拼接
+    local tmp_conf
+    tmp_conf=$(mktemp) || return 1
+    { echo "load_module ${stream_module};"; cat /etc/nginx/nginx.conf; } > "$tmp_conf"
+    mv "$tmp_conf" /etc/nginx/nginx.conf
+    _ok "已添加 load_module ngx_stream_module"
+}
+
+# 让 nginx 加载 /etc/nginx/stream.conf.d/*.conf
+# Alpine 的 nginx-mod-stream 自带 /etc/nginx/conf.d/stream.conf（已有 stream{} 块），
+# 这时不能再追加一个 stream 块，否则 nginx 报 "stream directive is duplicate"
+ensure_nginx_stream_include() {
+    local f lineno
+    for f in /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf; do
+        [[ -f "$f" ]] || continue
+        if grep -q "stream.conf.d" "$f" 2>/dev/null; then
+            return 0
+        fi
+        lineno=$(grep -nE '^[[:space:]]*stream[[:space:]]*\{' "$f" 2>/dev/null | head -1 | cut -d: -f1)
+        if [[ -n "$lineno" ]]; then
+            local tmp_conf
+            tmp_conf=$(mktemp) || return 1
+            awk -v n="$lineno" 'NR==n{print; print "    include /etc/nginx/stream.conf.d/*.conf;"; next}{print}' \
+                "$f" > "$tmp_conf" && mv "$tmp_conf" "$f"
+            _ok "已在现有 stream 块 (${f#/etc/nginx/}) 中注入 include"
+            return 0
+        fi
+    done
+
+    cat >> /etc/nginx/nginx.conf <<'STREAMEOF'
 
 # SNI stream 分流 (VLESS Reality)
 stream {
     include /etc/nginx/stream.conf.d/*.conf;
 }
 STREAMEOF
-            _ok "已在 nginx.conf 末尾添加 stream block"
-        fi
-    fi
+    _ok "已在 nginx.conf 末尾添加 stream block"
 }
 
 create_nginx_service() {
-    if [[ "$DISTRO" != "alpine" ]]; then
-        systemctl enable nginx 2>/dev/null
-    else
-        rc-update add nginx default 2>/dev/null
-    fi
+    case "$SVC_MGR" in
+        openrc)  rc-update add nginx default 2>/dev/null ;;
+        systemd) systemctl enable nginx 2>/dev/null ;;
+    esac
 }
 
 restart_nginx() {
     # 先测试配置
     if nginx -t 2>&1 | grep -q "successful"; then
-        svc restart nginx
+        svc_up nginx
         sleep 1
         if is_service_active nginx; then
             _ok "Nginx 已重启 (SNI 分流生效)"
@@ -552,33 +695,58 @@ restart_nginx() {
     fi
 }
 
+# 放行端口：firewalld / ufw / SELinux（CentOS 系常见拦路虎），全部尽力而为
+open_firewall_port() {
+    local port="$1"
+    [[ -z "$port" ]] && return 0
+
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        if ! firewall-cmd --query-port="${port}/tcp" >/dev/null 2>&1; then
+            firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 && \
+            firewall-cmd --reload >/dev/null 2>&1 && _ok "firewalld 已放行 ${port}/tcp"
+        fi
+    fi
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "${port}/tcp" >/dev/null 2>&1 && _ok "ufw 已放行 ${port}/tcp"
+    fi
+
+    # SELinux 为 Enforcing 时，nginx 只能 bind 已标记为 http_port_t 的端口
+    if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
+        if command -v semanage >/dev/null 2>&1; then
+            if ! semanage port -l 2>/dev/null | grep -qE "^http_port_t\b.*[[:space:]]${port}(,|$)"; then
+                semanage port -a -t http_port_t -p tcp "$port" >/dev/null 2>&1 && \
+                    _ok "SELinux 已标记 ${port}/tcp 为 http_port_t"
+            fi
+        else
+            _warn "SELinux Enforcing 但缺少 semanage，非 443 端口可能 bind 失败"
+            _warn "可安装 policycoreutils-python-utils 后重试"
+        fi
+    fi
+    return 0
+}
+
 #═══════════════════════════════════════════════════════════════════════════════
 #  Xray 核心安装
 #═══════════════════════════════════════════════════════════════════════════════
 
 install_xray() {
-    if check_cmd xray; then
-        local ver
-        ver=$(xray version 2>/dev/null | head -n1 | awk '{print $2}')
-        _ok "Xray 已安装: v${ver}"
-        return 0
+    local version="$XRAY_VERSION" ver
+    if [[ -x "$XRAY_BIN" ]]; then
+        ver=$("$XRAY_BIN" version 2>/dev/null | head -n1 | awk '{print $2}')
+        if [[ "${ver#v}" == "$version" ]]; then
+            _ok "Xray 已安装: v${version}"
+            return 0
+        fi
+        _info "Xray 当前版本: ${ver:-未知版本}，将安装指定版本 v${version}"
     fi
 
-    _info "安装 Xray-core..."
+    _info "安装 Xray-core v${version}..."
 
-    # 获取最新版本
-    local version
-    version=$(curl -fsSL --connect-timeout "$CURL_TIMEOUT" \
-        "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
-        | jq -r '.tag_name' 2>/dev/null)
-    version="${version#v}"
-
-    if [[ -z "$version" || "$version" == "null" ]]; then
-        _err "无法获取 Xray 最新版本"
-        return 1
+    # XTLS 官方只发布 glibc 构建，Alpine(musl) 必须靠 gcompat 兼容层才能运行
+    if [[ "$PKG_MGR" == "apk" ]]; then
+        pkg_install gcompat || true
     fi
-
-    _info "最新版本: v${version}"
 
     # 架构检测
     local arch
@@ -604,14 +772,29 @@ install_xray() {
 
     unzip -oq "$tmp/xray.zip" -d "$tmp/" || { rm -rf "$tmp"; _err "解压失败"; return 1; }
 
-    install -m 755 "$tmp/xray" "$XRAY_BIN"
+    install -m 755 "$tmp/xray" "$XRAY_BIN" || {
+        rm -rf "$tmp"
+        _err "无法安装指定 Xray 版本 v${version}"
+        return 1
+    }
 
     # 安装 geoip/geosite 数据文件
     mkdir -p /usr/local/share/xray
     cp "$tmp"/*.dat /usr/local/share/xray/ 2>/dev/null || true
 
     rm -rf "$tmp"
-    _ok "Xray v${version} 安装完成"
+
+    if ! "$XRAY_BIN" version >/dev/null 2>&1; then
+        _err "Xray 已下载但无法执行"
+        if [[ "$PKG_MGR" == "apk" ]]; then
+            _warn "Alpine 需要 glibc 兼容层: apk add gcompat"
+        fi
+        return 1
+    fi
+
+    local installed_ver
+    installed_ver=$("$XRAY_BIN" version 2>/dev/null | head -n1 | awk '{print $2}')
+    _ok "Xray ${installed_ver:-v$version} 安装完成"
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -1362,17 +1545,22 @@ do_install() {
     _line
 
     # 1. 检测系统
-    _info "系统: $DISTRO"
-    local ipv4 ipv6
+    _info "系统: $DISTRO (包管理器: $PKG_MGR, 服务: $SVC_MGR)"
+    local ipv4 ipv6 ipv4_nat=false
     ipv4=$(get_ipv4)
     ipv6=$(get_ipv6)
     echo -e "  IPv4: ${ipv4:-${R}无${NC}}"
     echo -e "  IPv6: ${ipv6:-${R}无${NC}}"
     [[ -z "$ipv4" && -z "$ipv6" ]] && { _err "无法获取公网 IP"; return 1; }
+    if [[ -n "$ipv4" ]] && ipv4_is_nat; then
+        ipv4_nat=true
+        echo -e "  ${Y}提示:${NC} 本机 IPv4 是 NAT 内网地址，公网 ${W}${ipv4}${NC} 需要在 NAT/安全组做端口转发才能入站"
+        [[ -n "$ipv6" ]] && echo -e "  ${Y}提示:${NC} IPv6 为直连，推荐优先使用 IPv6 链接"
+    fi
     echo ""
 
     # 2. 安装依赖
-    install_deps
+    install_deps || { _err "依赖安装失败，请检查软件源"; return 1; }
 
     # 3. 安装 Xray
     install_xray || { _err "Xray 安装失败"; return 1; }
@@ -1412,6 +1600,7 @@ do_install() {
         *) port=443 ;;
     esac
     _info "端口: $port"
+    open_firewall_port "$port"
     echo ""
 
     # 6. 选择 SNI 域名
@@ -1504,8 +1693,8 @@ do_install() {
     echo -e "  ${D}• 其他 SNI → 黑洞 (防 CF CDN 流量被盗刷)${NC}"
     echo ""
     echo -e "  ${W}连接信息:${NC}"
-    echo -e "  IPv4:   ${ipv4:-${D}无${NC}}"
-    [[ -n "$ipv6" ]] && echo -e "  IPv6:   $ipv6"
+    echo -e "  IPv4:   ${ipv4:-${D}无${NC}}$([[ "$ipv4_nat" == "true" ]] && echo -e "  ${Y}(NAT，需端口转发)${NC}")"
+    [[ -n "$ipv6" ]] && echo -e "  IPv6:   $ipv6${D} (直连)${NC}"
     echo -e "  端口:   $port"
     echo -e "  SNI:    $sni"
     echo -e "  加密:   none"
@@ -1527,8 +1716,12 @@ do_install() {
     fi
     echo ""
 
-    # 保存 join 链接（优先 IPv4）
-    echo "${link4:-$link6}" > "$CFG/join.txt"
+    # 保存 join 链接：IPv4 走 NAT 时优先 IPv6 直连
+    if [[ "$ipv4_nat" == "true" && -n "$link6" ]]; then
+        echo "$link6" > "$CFG/join.txt"
+    else
+        echo "${link4:-$link6}" > "$CFG/join.txt"
+    fi
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -1641,6 +1834,7 @@ change_port() {
 
     db_set_field --arg p "$new_port" '.port=($p|tonumber)'
     _ok "端口已改为 $new_port"
+    open_firewall_port "$new_port"
 
     # 同时更新 Xray 和 Nginx SNI 配置 (Nginx 监听端口也需同步)
     if generate_xray_config 2>/dev/null; then
@@ -1705,7 +1899,7 @@ do_uninstall() {
     svc stop nginx 2>/dev/null
 
     _info "移除 Xray 服务..."
-    if [[ "$DISTRO" == "alpine" ]]; then
+    if [[ "$SVC_MGR" == "openrc" ]]; then
         rc-update del vless-reality default 2>/dev/null
         rm -f /etc/init.d/vless-reality
     else
@@ -1716,14 +1910,18 @@ do_uninstall() {
 
     _info "移除 Nginx SNI 分流配置..."
     rm -f "$NGINX_SNI_CONF"
-    # 从 nginx.conf 中移除 stream block
+    # 从 nginx.conf 中移除追加的 stream block，以及各家族配置里注入的 include
     if [[ -f /etc/nginx/nginx.conf ]]; then
         sed -i '/# SNI stream 分流/,/^}/d' /etc/nginx/nginx.conf 2>/dev/null
         sed -i '/include.*stream\.conf\.d/d' /etc/nginx/nginx.conf 2>/dev/null
     fi
+    if [[ -f /etc/nginx/conf.d/stream.conf ]]; then
+        sed -i '/include.*stream\.conf\.d/d' /etc/nginx/conf.d/stream.conf 2>/dev/null
+    fi
 
     _info "删除二进制..."
     rm -f "$XRAY_BIN"
+    rm -f /var/log/vless-reality.log
 
     _info "删除配置目录..."
     rm -rf "$CFG"
@@ -1739,9 +1937,12 @@ do_uninstall() {
 show_logs() {
     echo -e "  ${W}最近 50 行日志:${NC}"
     _line
-    if [[ "$DISTRO" == "alpine" ]]; then
-        cat /var/log/messages 2>/dev/null | grep -i "xray\|vless" | tail -50 || \
-            _warn "无法读取日志"
+    if [[ "$SVC_MGR" == "openrc" ]]; then
+        if [[ -f /var/log/vless-reality.log ]]; then
+            tail -50 /var/log/vless-reality.log 2>/dev/null || _warn "无法读取日志"
+        else
+            _warn "日志文件不存在: /var/log/vless-reality.log"
+        fi
     else
         journalctl -u vless-reality -n 50 --no-pager 2>/dev/null || \
             _warn "无法读取日志"
@@ -1764,6 +1965,10 @@ enable_bbr() {
     fi
 
     _info "启用 BBR..."
+
+    # Alpine 等精简系统可能没自动加载模块
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    modprobe sch_fq >/dev/null 2>&1 || true
 
     # 幂等写入：先删除旧的 BBR 配置行，再追加
     if [[ -f /etc/sysctl.conf ]]; then
@@ -1868,6 +2073,36 @@ main_menu() {
 #  命令行参数
 #═══════════════════════════════════════════════════════════════════════════════
 
+XRAY_VERSION="26.11.9"
+cli_args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --xray-version)
+            if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+                _err "--xray-version 需要版本号，例如 26.11.9"
+                exit 1
+            fi
+            XRAY_VERSION="$2"
+            shift 2
+            ;;
+        --xray-version=*)
+            XRAY_VERSION="${1#*=}"
+            shift
+            ;;
+        *)
+            cli_args+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${cli_args[@]}"
+XRAY_VERSION="${XRAY_VERSION#v}"
+if [[ ! "$XRAY_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    _err "无效 Xray 版本号: $XRAY_VERSION（示例: 26.11.9）"
+    exit 1
+fi
+readonly XRAY_VERSION
+
 case "${1:-}" in
     --install)
         check_root; init_db; do_install
@@ -1895,6 +2130,7 @@ case "${1:-}" in
         echo ""
         echo "选项:"
         echo "  --install          直接安装 (非交互)"
+        echo "  --xray-version <版本> 指定 Xray 版本 (默认固定 26.11.9，可带 v 前缀)"
         echo "  --uninstall        完全卸载"
         echo "  --status           显示配置状态"
         echo "  --links            显示分享链接"

@@ -14,9 +14,25 @@
 
 ## 你需要什么？
 
-- 一台 VPS（推荐 Debian/Ubuntu，阿里云腾讯云 Vultr 都行）
+- 一台 VPS（Debian/Ubuntu/CentOS/RHEL/Alma/Rocky/Fedora/Alpine 都行）
 - root 权限
 - 会复制粘贴命令
+
+## 系统支持
+
+| 发行版 | 包管理 | 服务管理 | 说明 |
+|--------|--------|----------|------|
+| Debian / Ubuntu | apt | systemd | 最常用 |
+| CentOS / RHEL / Alma / Rocky / Fedora | dnf / yum | systemd | 自动装 `nginx-mod-stream`，自动放行 firewalld 端口、标记 SELinux `http_port_t` |
+| Alpine | apk | openrc | 自动装 `bash` / `gcompat` / `nginx-mod-stream` / `nginx-openrc` |
+
+Alpine 上 Xray 用的是官方 glibc 二进制，靠 `gcompat` 兼容层运行（官方没有 musl 构建）。
+CentOS 7 需要 EPEL 才有 nginx，脚本会自动尝试；Alma/Rocky 9 直接从 AppStream 取。
+
+## NAT / 双栈说明
+
+- 如果公网 IPv4 要靠 NAT 映射（本机网卡是 100.64/10 或内网地址），脚本会提示并**优先输出 IPv6 直连链接**，IPv4 链接需要你自己在 NAT 和安全组上做端口转发。
+- IPv6 为直连时会自动生成 `vless://...@[IPv6]:端口` 形式的链接。
 
 ## 安装
 
