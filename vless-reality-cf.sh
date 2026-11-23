@@ -1234,7 +1234,7 @@ generate_xray_config() {
         }
     }' > "$tmp" || { rm -f "$tmp"; return 1; }
 
-    if ! "$XRAY_BIN" run -test -c "$tmp"; then
+    if ! "$XRAY_BIN" run -test -format json -c "$tmp"; then
         rm -f "$tmp"
         _err "Xray 配置校验失败，原配置未修改"
         return 1
