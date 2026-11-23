@@ -1187,8 +1187,10 @@ generate_xray_config() {
     clients=$(build_clients_json) || return 1
     [[ -z "$clients" ]] && { _err "无法读取用户配置"; return 1; }
 
-    local tmp
-    tmp=$(mktemp "$CFG/.xray.XXXXXX") || return 1
+    # Xray 的外部加载器即使指定格式，也会检查文件扩展名。
+    local tmp_dir tmp
+    tmp_dir=$(mktemp -d "$CFG/.xray.XXXXXX") || return 1
+    tmp="$tmp_dir/config.json"
 
     jq -n \
         --argjson internal_port "$XRAY_INTERNAL_PORT" \
@@ -1232,14 +1234,17 @@ generate_xray_config() {
                 {type: "field", ip: ["geoip:private"], outboundTag: "block"}
             ]
         }
-    }' > "$tmp" || { rm -f "$tmp"; return 1; }
+    }' > "$tmp" || { rm -f "$tmp"; rmdir "$tmp_dir"; return 1; }
+    chmod 600 "$tmp" || { rm -f "$tmp"; rmdir "$tmp_dir"; return 1; }
 
     if ! "$XRAY_BIN" run -test -format json -c "$tmp"; then
         rm -f "$tmp"
+        rmdir "$tmp_dir"
         _err "Xray 配置校验失败，原配置未修改"
         return 1
     fi
-    mv -f "$tmp" "$XRAY_CONFIG" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$XRAY_CONFIG" || { rm -f "$tmp"; rmdir "$tmp_dir"; return 1; }
+    rmdir "$tmp_dir" || return 1
     _ok "Xray 配置已生成: $XRAY_CONFIG"
 }
 

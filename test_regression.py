@@ -84,7 +84,18 @@ XRAY_VERSION=26.11.9
     def xray(self, version="26.11.9", validation=0):
         self.binary.write_text(
             '#!/bin/sh\nif [ "$1" = version ]; then printf "Xray ' + version +
-            '\\n"; exit 0; fi\nexit ' + str(validation) + '\n'
+            '\\n"; exit 0; fi\n'
+            'while [ "$#" -gt 0 ]; do\n'
+            '  case "$1" in\n'
+            '    -c|-config)\n'
+            '      shift\n'
+            '      case "$1" in *.json) ;; *) exit 23 ;; esac\n'
+            '      [ -f "$1" ] || exit 23\n'
+            '      ;;\n'
+            '  esac\n'
+            '  shift\n'
+            'done\n'
+            'exit ' + str(validation) + '\n'
         )
         self.binary.chmod(0o755)
 
@@ -152,6 +163,8 @@ for f in files + ([target] if loaded and target.exists() else []):
         self.xray()
         self.run_shell("generate_xray_config")
         self.assertEqual(json.loads(self.config.read_text())["inbounds"][0]["settings"]["clients"], [])
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(list(self.cfg.glob(".xray.*")), [])
 
     def test_invalid_candidate_config_preserves_existing(self):
         self.xray(validation=1)
